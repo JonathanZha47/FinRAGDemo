@@ -1,0 +1,93 @@
+# LLM Provider Configurations
+model:
+  provider: "openai"
+  model_name: "gpt-3.5-turbo"
+  temperature: 0.7
+
+llm_providers:
+  openai:
+    temperature: 0.1
+    models:
+      - "gpt-3.5-turbo"
+      - "gpt-4"
+      - "gpt-o3-mini"
+      - "gpt-4o"
+    context_window: 4096
+    max_output_tokens: 4096
+    
+  huggingface:
+    models: mistralai/Mixtral-8x7B-Instruct-v0.1
+    temperature: 0.1
+    repetition_penalty: 1.1
+    context_window: 4096
+    
+  openrouter:
+    models: 
+      - mistralai/mixtral-8x7b-instruct
+      - deepseek/deepseek-r1:free
+    temperature: 0.1
+    context_window: 4096
+
+# Query Configurations
+query:
+  preprocessing:
+    enable_spell_check: true
+    enable_grammar_check: true
+    enable_query_expansion: true
+  decomposition:
+    max_sub_queries: 3
+    enable_dependency_tracking: true
+  retrieval:
+    hybrid_search_weights:
+      bm25: 0.4
+      vector: 0.4
+      keyword: 0.2
+    rerank_top_k: 10
+
+# RAG Configurations
+rag:
+  chunk_size: 1024
+  chunk_overlap: 20
+  similarity_top_k: 3
+  response_mode: "compact"
+
+# Embedding Configurations
+embeddings:
+  model: "text-embedding-3-small"
+  dimension: 1536
+
+# Storage Configurations
+storage:
+  persist_dir: "storage"
+  
+# Data Ingestion
+data:
+  input_dir: "data"
+  supported_formats: [".txt", ".pdf", ".docx", ".md"]
+  ocr_config:
+    poppler_path: "/opt/homebrew/bin"
+    tesseract_config: "--psm 6 --oem 3 -c preserve_interword_spaces=1"
+    easyocr_languages: ["en"]
+    use_gpu: false  # Set to true if you want to use GPU acceleration
+
+# UI Configurations
+ui:
+  temperature_range: [0.0, 1.0, 0.1]
+  top_k_range: [1, 10, 1]
+  chunk_size_range: [256, 2048, 128]
+  max_tokens_range: [50, 2000, 50]
+  output_tokens_range:
+    openai:
+      "gpt-3.5-turbo": [1, 4096, 50]
+      "gpt-4": [1, 4096, 50]
+      "gpt-o3-mini": [1, 4096, 50]
+      "gpt-4o": [1, 4096, 50]
+    huggingface:
+      "mistralai/Mixtral-8x7B-Instruct-v0.1": [1, 4096, 50]
+    openrouter:
+      "mistralai/mixtral-8x7b-instruct": [1, 4096, 50]
+      "deepseek/deepseek-r1:free": [1, 5000, 50]
+  available_models:
+    openai: ["gpt-3.5-turbo", "gpt-4", "gpt-o3-mini", "gpt-4o"]
+    huggingface: ["mistralai/Mixtral-8x7B-Instruct-v0.1"]
+    openrouter: ["mistralai/mixtral-8x7b-instruct", "deepseek/deepseek-r1:free"] 
