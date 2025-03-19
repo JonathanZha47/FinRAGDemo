@@ -1,6 +1,6 @@
-# Financial Advisor RAG Chatbot
+# SMARTFinAgent: An Agentic RAG for Financial Advising and Decision Support
 
-A simple RAG-based chatbot that provides financial advice based on uploaded documents. Built with LlamaIndex and Streamlit.
+An Agentic RAG-based LLM that provides financial advices. Built with LlamaIndex and Streamlit.
 
 ## Features
 
@@ -24,7 +24,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Create a `.env` file in the root directory and add your OpenAI API key:
+3. Create a `.env` file in the root directory and add your OpenAI/HuggingFace/OpenRouter API key:
 ```
 OPENAI_API_KEY=your_api_key_here
 ```
