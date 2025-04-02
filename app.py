@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import logging
 from utils import process_documents, get_response
 import tempfile
 from dotenv import load_dotenv
@@ -9,10 +10,38 @@ from src.indexing.index_manager import IndexManager
 from src.storing.storage_manager import StorageManager
 from src.querying.query_engine import QueryEngine
 from src.prompting.prompt_manager import PromptManager
-from typing import Dict
+from typing import Dict, List
+
+# Added LlamaIndex core imports for pipeline
+from llama_index.core import VectorStoreIndex, StorageContext, Document
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.extractors import TitleExtractor
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.ingestion import IngestionPipeline
+
+# --- Configure Logging --- 
+# Set root logger level - Note: Streamlit might interfere slightly, 
+# but this sets the baseline for non-Streamlit handlers and our own loggers.
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
+
+# Get a logger for this specific module (app.py)
+logger = logging.getLogger(__name__)
+
+# Silence overly verbose library loggers by setting their level higher
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING) # httpx uses httpcore
+# You might want to adjust llama_index level too if it becomes noisy
+# logging.getLogger("llama_index").setLevel(logging.WARNING) 
+
+logger.info("Logging configured. OpenAI and HTTPx loggers set to WARNING level.")
+# --- End Logging Config ---
 
 # Load environment variables
 load_dotenv()
+logger.info("Environment variables loaded.")
 
 # Initialize configuration
 config_loader = ConfigLoader()
@@ -23,20 +52,21 @@ openai_key = os.getenv("OPENAI_API_KEY")
 huggingface_key = os.getenv("HUGGINGFACE_API_KEY") 
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
 
+# Use logger for API key status messages
 if openai_key:
-    print("✅ OpenAI API Key Loaded Successfully:", openai_key[:5] + "..." + openai_key[-5:])
+    logger.info("✅ OpenAI API Key Loaded Successfully: %s...%s", openai_key[:5], openai_key[-5:])
 else:
-    print("⚠️ OpenAI API Key is missing! Check your .env file.")
+    logger.warning("⚠️ OpenAI API Key is missing! Check your .env file.")
 
 if huggingface_key:
-    print("✅ HuggingFace API Key Loaded Successfully:", huggingface_key[:5] + "..." + huggingface_key[-5:])
+    logger.info("✅ HuggingFace API Key Loaded Successfully: %s...%s", huggingface_key[:5], huggingface_key[-5:])
 else:
-    print("⚠️ HuggingFace API Key is missing! Check your .env file.")
+    logger.warning("⚠️ HuggingFace API Key is missing! Check your .env file.")
 
 if openrouter_key:
-    print("✅ OpenRouter API Key Loaded Successfully:", openrouter_key[:5] + "..." + openrouter_key[-5:])
+    logger.info("✅ OpenRouter API Key Loaded Successfully: %s...%s", openrouter_key[:5], openrouter_key[-5:])
 else:
-    print("⚠️ OpenRouter API Key is missing! Check your .env file.")
+    logger.warning("⚠️ OpenRouter API Key is missing! Check your .env file.")
 
 # Available LLM providers
 LLM_PROVIDERS = {
@@ -52,25 +82,21 @@ st.set_page_config(
 )
 
 def save_uploaded_file(uploaded_file):
+    """Saves uploaded file to the data directory."""
     try:
-        # Create data directory if it doesn't exist
-        if not os.path.exists("data"):
-            os.makedirs("data")
+        data_dir = "data"
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+            logger.info(f"Created data directory: {data_dir}")
         
-        # Save uploaded file
-        file_path = os.path.join("data", uploaded_file.name)
+        file_path = os.path.join(data_dir, uploaded_file.name)
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
+        logger.info(f"Successfully saved uploaded file to: {file_path}")
         return True, file_path
     except Exception as e:
+        logger.error(f"Error saving uploaded file {uploaded_file.name}: {e}", exc_info=True)
         return False, str(e)
-
-def initialize_session_state():
-    """Initialize session state variables."""
-    if 'index' not in st.session_state:
-        st.session_state.index = None
-    if 'documents_loaded' not in st.session_state:
-        st.session_state.documents_loaded = False
 
 def sidebar_settings(ui_config: dict):
     """Create sidebar with parameter settings."""
@@ -192,16 +218,15 @@ def display_query_analysis(analysis: Dict):
         
         # Display retrieval recommendation
         st.write("\n**Retrieval Strategy:**")
-        requires_retrieval = analysis.get('requires_retrieval', False)
-        print("requires_retrieval", requires_retrieval)
-        if requires_retrieval:
-            st.write("✅ RAG Recommended")
-            # Show RAG status message if available
-            if 'rag_status' in analysis:
-                st.write("Current RAG Status:")
-                st.info(analysis['rag_status'])
+        # Use rag_status for more accurate info on what happened
+        rag_status = analysis.get('rag_status', 'N/A')
+        if "Used RAG" in rag_status:
+            st.write("✅ RAG Used")
+        elif "RAG Attempted" in rag_status or "RAG Needed" in rag_status:
+             st.write("⚠️ RAG Recommended/Attempted (Fallback to Direct)")
         else:
-            st.write("❌ Direct Query Recommended")
+            st.write("❌ Direct Query Used")
+        st.info(f"Status: {rag_status}")
     
     with col2:
         # Display companies mentioned
@@ -210,6 +235,19 @@ def display_query_analysis(analysis: Dict):
             st.write("**Companies Mentioned:**")
             for company in companies:
                 st.write(f"- {company}")
+        
+        # Display decomposition if available
+        decomposition = analysis.get('decomposition')
+        if decomposition and isinstance(decomposition, dict):
+            st.write("**Query Decomposition:**")
+            sub_problems = decomposition.get('sub_problems', [])
+            if sub_problems:
+                 for i, sp in enumerate(sub_problems):
+                      st.write(f"- Sub-problem {i+1}: {sp.get('query', 'N/A')}")
+            elif decomposition.get('error'):
+                 st.warning(f"Decomposition failed: {decomposition['error']}")
+            else:
+                 st.write("- No sub-problems identified.")
     
     # Display LLM analysis if available
     llm_analysis = analysis.get('llm_analysis')
@@ -223,76 +261,49 @@ def display_verification_results(citations: Dict, hallucination_check: Dict, com
     """Display verification results in an organized manner."""
     st.write("### Response Verification")
     
-    # Citations
-    with st.expander("Citation Verification", expanded=True):
-        st.write(f"**Verification Score:** {citations['verification_score']:.2%}")
-        
-        st.write("**Verified Statements:**")
-        for citation in citations['verified']:
-            st.markdown(f"✅ {citation['statement']}")
-            st.markdown(f"*Source: {citation['source']}*")
+    if citations:
+        with st.expander("Citation Verification", expanded=True):
+            score = citations.get('verification_score', 0.0)
+            st.write(f"**Verification Score:** {score:.2%}")
             
-        if citations['unverified']:
-            st.write("**Unverified Statements:**")
-            for statement in citations['unverified']:
-                st.markdown(f"❌ {statement}")
-    
-    # Hallucination Detection
-    with st.expander("Hallucination Detection", expanded=True):
-        st.write(f"**Confidence Score:** {hallucination_check['confidence_score']:.2%}")
-        
-        if hallucination_check['warning_flags']:
-            st.write("**Warning Flags:**")
-            for flag in hallucination_check['warning_flags']:
-                st.warning(flag)
-    
-    # SEC Compliance
-    with st.expander("SEC Compliance Check", expanded=True):
-        if compliance_check['compliant']:
-            st.success("✅ Response complies with SEC guidelines")
-        else:
-            st.error("❌ Response has compliance issues")
+            st.write("**Verified Statements:**")
+            for citation in citations.get('verified', []):
+                st.markdown(f"✅ {citation.get('statement', 'N/A')}")
+                st.markdown(f"*Source: {citation.get('source', 'N/A')}*", unsafe_allow_html=True)
             
-        if compliance_check['violations']:
-            st.write("**Violations:**")
-            for violation in compliance_check['violations']:
-                st.error(violation)
+            if citations.get('unverified'):
+                st.write("**Unverified Statements:**")
+                for statement in citations.get('unverified', []):
+                    st.markdown(f"❌ {statement}")
+    
+    if hallucination_check:
+        with st.expander("Hallucination Detection", expanded=True):
+            score = hallucination_check.get('confidence_score', 0.0)
+            st.write(f"**Confidence Score:** {score:.2%}")
+            
+            if hallucination_check.get('warning_flags'):
+                st.write("**Warning Flags:**")
+                for flag in hallucination_check['warning_flags']:
+                    st.warning(flag)
+    
+    if compliance_check:
+        with st.expander("SEC Compliance Check", expanded=True):
+            if compliance_check.get('compliant', False):
+                st.success("✅ Response complies with SEC guidelines")
+            else:
+                st.error("❌ Response has compliance issues")
+            
+            if compliance_check.get('violations'):
+                st.write("**Violations:**")
+                for violation in compliance_check['violations']:
+                    st.error(violation)
                 
-        if compliance_check['warnings']:
-            st.write("**Warnings:**")
-            for warning in compliance_check['warnings']:
-                st.warning(warning)
+            if compliance_check.get('warnings'):
+                st.write("**Warnings:**")
+                for warning in compliance_check['warnings']:
+                    st.warning(warning)
     
     st.markdown("---")
-
-def process_uploaded_file(uploaded_file, document_loader: DocumentLoader, index_manager: IndexManager) -> bool:
-    """Process a single uploaded file."""
-    try:
-        # Save uploaded file to data directory
-        if not os.path.exists("data"):
-            os.makedirs("data")
-            
-        file_path = os.path.join("data", uploaded_file.name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        # Process the single file
-        documents = document_loader.load_single_document(file_path)
-        if documents:
-            # Create or update index
-            if st.session_state.index is None:
-                st.session_state.index = index_manager.create_index(documents)
-            else:
-                # Add new documents to existing index
-                for doc in documents:
-                    st.session_state.index.insert(doc)
-            
-            st.session_state.documents_loaded = True
-            return True
-        return False
-    except Exception as e:
-        st.error(f"Error processing file {uploaded_file.name}: {str(e)}")
-        return False
 
 def main():
     st.title("💰 AI Financial Advisor")
@@ -301,42 +312,88 @@ def main():
     Optionally, upload documents to get more context-aware responses.
     """)
     
-    # Initialize session state
-    initialize_session_state()
-    
     # Get settings from sidebar
     settings = sidebar_settings(ui_config)
     
-    # Initialize components
+    # Initialize core components (consider making QueryEngine singleton if needed)
     document_loader = DocumentLoader(config_loader)
-    index_manager = IndexManager(config_loader)
     storage_manager = StorageManager(config_loader)
-    query_engine = QueryEngine(config_loader)
+    query_engine = QueryEngine(config_loader) # Loads index on init now
     prompt_manager = PromptManager(config_loader)
     
+    # --- Ingestion Pipeline Setup --- 
+    # Define transformations based on settings or config
+    # Using OpenAIEmbedding, assuming OPENAI_API_KEY is set
+    transformations = [
+        SentenceSplitter(chunk_size=settings['chunk_size'], chunk_overlap=20),
+        OpenAIEmbedding() # Ensure API key is available
+    ]
+    
+    # Get storage context (points to the persistent vector store)
+    storage_context = StorageContext.from_defaults(persist_dir=storage_manager.persist_dir)
+    
+    # Create the pipeline
+    pipeline = IngestionPipeline(
+        transformations=transformations,
+        vector_store=storage_context.vector_store # Use the store from context
+    )
+    logger.info(f"Ingestion pipeline initialized to use vector store at: {storage_manager.persist_dir}")
+    # --- End Pipeline Setup --- 
+
     # File upload section
     st.subheader("Document Upload")
     uploaded_files = st.file_uploader(
         "Upload your financial documents",
         accept_multiple_files=True,
-        type=['txt', 'pdf', 'docx']
+        type=['txt', '.pdf', '.docx'] # Make sure this matches DocumentLoader
     )
     
     if uploaded_files:
         if st.button("Process Documents"):
-            with st.spinner("Processing documents..."):
-                success_count = 0
-                for file in uploaded_files:
-                    if process_uploaded_file(file, document_loader, index_manager):
-                        success_count += 1
+            saved_file_paths = []
+            with st.spinner("Saving uploaded files..."):
+                for uploaded_file in uploaded_files:
+                    success, saved_path = save_uploaded_file(uploaded_file)
+                    if success:
+                        saved_file_paths.append(saved_path)
+                    else:
+                        st.error(f"Failed to save file: {uploaded_file.name} - {saved_path}")
+            
+            if saved_file_paths:
+                all_raw_docs: List[Document] = []
+                with st.spinner("Loading document content..."):
+                    for file_path in saved_file_paths:
+                        # Load raw documents one by one
+                        raw_docs = document_loader.load_single_document(file_path)
+                        if raw_docs:
+                            all_raw_docs.extend(raw_docs)
+                        else:
+                             st.warning(f"Could not load content from {os.path.basename(file_path)}")
                 
-                if success_count > 0:
-                    if storage_manager and st.session_state.index:
-                        storage_manager.save_index(st.session_state.index)
-                    st.success(f"Successfully processed {success_count} document(s)!")
+                if all_raw_docs:
+                    with st.spinner(f"Running ingestion pipeline for {len(all_raw_docs)} document sections..."):
+                        try:
+                            # Run the pipeline
+                            pipeline.run(documents=all_raw_docs)
+                            logger.info(f"Ingestion pipeline completed for {len(saved_file_paths)} files.")
+                            
+                            # IMPORTANT: Update QueryEngine's index reference
+                            logger.info("Reloading index for Query Engine...")
+                            reloaded_index = storage_manager.load_index()
+                            if reloaded_index:
+                                query_engine.update_index(reloaded_index)
+                                st.success(f"Successfully processed and indexed {len(saved_file_paths)} document(s)!")
+                            else:
+                                st.error("Pipeline ran, but failed to reload the updated index.")
+                                
+                        except Exception as pipe_err:
+                            logger.error(f"Ingestion pipeline failed: {pipe_err}", exc_info=True)
+                            st.error(f"Error during document processing pipeline: {pipe_err}")
                 else:
-                    st.error("No documents were successfully processed.")
-    
+                    st.error("No content could be extracted from the uploaded files.")
+            else:
+                st.error("No files were successfully saved for processing.")
+
     # Query section
     st.subheader("Ask Questions")
     query = st.text_input("Enter your financial question:")
@@ -345,10 +402,10 @@ def main():
     
     if query:
         with st.spinner("Processing query..."):
-            # Process query with enhanced pipeline
+            # Process query - Pass None for index, QE uses its internal one
             response, success, analysis = query_engine.process_query(
                 query=query,
-                index=st.session_state.index if st.session_state.documents_loaded else None,
+                index=None, # QueryEngine uses its own loaded index
                 provider_name=settings["provider_name"],
                 model_name=settings["model"],
                 force_rag=force_rag,
@@ -357,43 +414,54 @@ def main():
                 max_output_tokens=settings["max_output_tokens"]
             )
             
-            # Create a container for the results
             results_container = st.container()
-            
             with results_container:
-                # Display query analysis first
                 display_query_analysis(analysis)
-                
-                # Display response
                 st.write("### Response")
                 if success:
                     st.write(response)
                 else:
                     st.error(response)
                 
-                # Determine if RAG was used
-                using_rag = force_rag or analysis.get('requires_retrieval', False)
+                # Determine if RAG was used based on analysis status
+                rag_status = analysis.get('rag_status', '')
+                was_rag_used = "Used RAG" in rag_status 
                 
-                # Only show verification results if using RAG
-                if using_rag and (settings["enable_citation_check"] or settings["enable_hallucination_check"] or settings["enable_guardrails"]):
-                    context = analysis.get("context", []) if analysis else []
+                # Only show verification if RAG was successfully used
+                if was_rag_used and (settings["enable_citation_check"] or settings["enable_hallucination_check"] or settings["enable_guardrails"]):
+                    # We need the actual context used by the LLM for verification.
+                    # This might require modification in PromptManager or QueryEngine 
+                    # to return the context along with the response.
+                    # For now, we'll simulate with an empty context or retrieved nodes if available.
                     
-                    # Perform verifications
-                    citations = prompt_manager.verify_citations(response, context) if settings["enable_citation_check"] else None
-                    hallucination_check = prompt_manager.detect_hallucination(response, context, citations) if settings["enable_hallucination_check"] else None
-                    compliance_check = prompt_manager.apply_guardrails(response, []) if settings["enable_guardrails"] else None
+                    # Placeholder: Get context if QueryEngine provides it in analysis
+                    llm_context = analysis.get("llm_context", "") 
                     
-                    # Display verification results
-                    display_verification_results(citations, hallucination_check, compliance_check)
-                
-                # Show processing details in expander
+                    citations, hallucination_check, compliance_check = None, None, None
+                    if llm_context: 
+                        if settings["enable_citation_check"]:
+                            citations = prompt_manager.verify_citations(response, llm_context)
+                        if settings["enable_hallucination_check"]:
+                            hallucination_check = prompt_manager.detect_hallucination(response, llm_context, citations)
+                        if settings["enable_guardrails"]:
+                            compliance_check = prompt_manager.apply_guardrails(response, []) # Guardrails might not need context
+                    else:
+                         st.warning("Verification requires context used by LLM, which is not currently passed back. Skipping verification steps.")
+
+                    # Display verification results if checks were run
+                    if citations or hallucination_check or compliance_check:
+                         display_verification_results(citations or {}, hallucination_check or {}, compliance_check or {})
+                    
+                # Show processing details
                 with st.expander("Query Processing Details"):
                     st.write("**Query Processing:**")
                     st.write("Original Query:", analysis.get('original_query', query))
                     st.write("Enhanced Query:", analysis.get('enhanced_query', query))
+                    if 'decomposition' in analysis and isinstance(analysis['decomposition'], dict) and 'sub_problems' in analysis['decomposition']:
+                         st.write("Sub-problems:", [sp.get('query') for sp in analysis['decomposition']['sub_problems']])
                     
                     st.write("\n**Generation Settings:**")
-                    st.write("Using RAG:", using_rag)
+                    st.write("RAG Status:", rag_status)
                     st.write("Model:", settings["model"])
                     st.write("Temperature:", settings["temperature"])
                     st.write("Prompt Type:", settings["prompt_type"])

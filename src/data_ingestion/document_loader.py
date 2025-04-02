@@ -1,69 +1,76 @@
 import os
 from pathlib import Path
 from typing import List, Optional, Union
-from llama_index.core import SimpleDirectoryReader
+from llama_index.core import SimpleDirectoryReader, Document
 from src.config.config_loader import ConfigLoader
 from src.data_ingestion.enhanced_document_loader import EnhancedDocumentLoader
+import logging
+
+logger = logging.getLogger(__name__)
 
 class DocumentLoader:
-    """Document loader for ingesting various file formats with table extraction."""
+    """Loads raw documents from various file formats using EnhancedDocumentLoader."""
     
     def __init__(self, config_loader: ConfigLoader):
         self.config = config_loader.get_data_config()
         self.input_dir = self.config.get('input_dir', 'data')
         self.supported_formats = self.config.get('supported_formats', ['.txt', '.pdf', '.docx'])
         
-        # Initialize enhanced document loader
+        # Initialize enhanced document loader (just for loading/parsing)
         self.enhanced_loader = EnhancedDocumentLoader()
     
-    def load_single_document(self, file_path: Union[str, Path]) -> List:
-        """Load and process a single document."""
+    def load_single_document(self, file_path: Union[str, Path]) -> List[Document]:
+        """Load a single document, returning raw Document objects."""
         try:
             file_path = Path(file_path)
+            logger.info(f"Attempting to load single document: {file_path}")
             
-            # Validate file format
             if not self.validate_file_format(file_path):
-                print(f"Unsupported file format: {file_path.suffix}")
+                logger.warning(f"Unsupported file format: {file_path.suffix}")
                 return []
             
-            # Process the file using enhanced loader
+            # Use enhanced loader to get raw documents (text + tables)
             documents = self.enhanced_loader.load_documents(file_path)
             
             if not documents:
-                print("No content was extracted from the document")
+                logger.warning(f"No content was extracted from the document: {file_path.name}")
                 return []
             
-            print(f"Successfully processed document: {file_path.name}")
+            logger.info(f"Successfully loaded {len(documents)} raw sections from: {file_path.name}")
             return documents
             
         except Exception as e:
-            print(f"Error processing document {file_path}: {str(e)}")
+            logger.error(f"Error processing single document {file_path}: {str(e)}", exc_info=True)
             return []
     
-    def load_documents(self, directory: Optional[str] = None) -> List:
-        """Load documents from specified directory."""
+    def load_documents_from_directory(self, directory: Optional[str] = None) -> List[Document]:
+        """Load all supported documents from a directory, returning raw Document objects."""
         try:
             target_dir = directory or self.input_dir
+            logger.info(f"Attempting to load documents from directory: {target_dir}")
             
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir)
-                print(f"Created directory {target_dir}, but no files found.")
+            target_path = Path(target_dir)
+            if not target_path.exists():
+                # Don't create it here, let the user manage the data dir
+                logger.warning(f"Data directory not found: {target_dir}")
                 return []
             
-            if not os.listdir(target_dir):
-                print("No files found in the data directory")
+            if not any(target_path.iterdir()): # Check if directory is empty
+                logger.warning(f"No files found in the data directory: {target_dir}")
                 return []
             
-            documents = self.enhanced_loader.load_documents(target_dir)
+            # Enhanced loader handles iterating the directory now
+            documents = self.enhanced_loader.load_documents(target_path)
+            
             if not documents:
-                print("No documents were loaded")
+                logger.warning(f"No documents were loaded from directory: {target_dir}")
                 return []
             
-            print(f"Successfully loaded {len(documents)} documents")
+            logger.info(f"Successfully loaded {len(documents)} raw sections from directory: {target_dir}")
             return documents
             
         except Exception as e:
-            print(f"Error loading documents: {str(e)}")
+            logger.error(f"Error loading documents from directory {target_dir}: {str(e)}", exc_info=True)
             return []
     
     def validate_file_format(self, file_path: Union[str, Path]) -> bool:

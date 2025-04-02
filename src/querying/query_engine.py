@@ -11,110 +11,105 @@ from src.utils.long_context_handler import LongContextHandler
 from llm_providers import get_llm_provider
 import logging
 import traceback
+from src.indexing.index_manager import IndexManager
+from src.storing.storage_manager import StorageManager
+from llama_index.core.indices.base import BaseIndex
 
 class QueryEngine:
-    """Enhanced query engine with problem decomposition and hybrid retrieval."""
+    """Manages the query processing pipeline."""
     
     def __init__(self, config_loader: ConfigLoader):
         self.config_loader = config_loader
         self.query_config = config_loader.get_query_config()
-        if not self.query_config:
-            raise ValueError("Query configuration is None. Please check config_loader.")
-        self.query_preprocessor = QueryPreprocessor(config_loader)
-        self.problem_decomposer = ProblemDecomposer()
+        self.index_manager = IndexManager(config_loader)
+        self.storage_manager = StorageManager(config_loader)
         self.prompt_manager = PromptManager(config_loader)
-        self.context_handler = None  # Will be initialized with model name when needed
+        self.query_preprocessor = QueryPreprocessor(config_loader)
+        self.context_handler = LongContextHandler(config_loader)
+        self.problem_decomposer = ProblemDecomposer()
         
-    def process_query(
-        self,
-        query: str,
-        index: Optional[object] = None,
-        provider_name: str = "openai",
-        model_name: str = "gpt-3.5-turbo",
-        force_rag: bool = False,
-        prompt_type: str = "context",
-        persona: Optional[str] = None,
-        max_output_tokens: int = 1000
-    ) -> Tuple[str, bool, Dict]:
-        """Process a query and generate a response."""
-        try:
-            # Validate inputs
-            if not query:
-                return "Error: Query cannot be empty", False, {}
+        # Load the index once during initialization if it exists
+        self.index = self.storage_manager.load_index()
+        if self.index:
+            logging.info("Stored index loaded successfully.")
+        else:
+            logging.warning("No stored index found or failed to load.")
             
-            # Initialize context handler with current model
-            self.context_handler = LongContextHandler(model_name)
+    def update_index(self, index: BaseIndex):
+        """Update the index used by the query engine."""
+        self.index = index
+        logging.info("Query engine index updated.")
+
+    def process_query(self, query: str, index: Optional[BaseIndex], provider_name: str,
+                      model_name: str, force_rag: bool, prompt_type: str,
+                      persona: Optional[str], max_output_tokens: int) -> Tuple[str, bool, Dict]:
+        """Process a user query through the RAG pipeline."""
+        try:
+            logging.info(f"Processing query: {query} with provider: {provider_name}, model: {model_name}")
             
             # Preprocess the query
-            try:
-                processed_query, analysis = self.query_preprocessor.preprocess_query(query)
-                if not processed_query:
-                    return "Error: Query preprocessing failed", False, {}
-            except Exception as e:
-                logging.error(f"Error in query preprocessing: {str(e)}")
-                return f"Error in query preprocessing: {str(e)}", False, {}
+            processed_query, analysis = self.query_preprocessor.preprocess_query(query)
+            analysis['original_query'] = query
+            analysis['enhanced_query'] = processed_query
             
-            # Decompose complex queries if enabled
+            # Decompose the query
             try:
-                if self.query_config.get('decomposition', {}).get('enable_dependency_tracking', True):
-                    decomposition = self.problem_decomposer.decompose_query(processed_query)
-                    analysis['decomposition'] = decomposition
+                decomposition = self.problem_decomposer.decompose_query(processed_query)
+                analysis['decomposition'] = decomposition
+                # Log only sub-problem queries for brevity if available
+                sub_queries = [sp.get('query', 'N/A') for sp in decomposition.get('sub_problems', [])]
+                logging.info(f"Query decomposition successful: {sub_queries}")
             except Exception as e:
-                logging.error(f"Error in query decomposition: {str(e)}")
-                # Continue processing even if decomposition fails
+                logging.error(f"Error during query decomposition: {str(e)}")
+                analysis['decomposition'] = {'error': str(e)} # Store error in analysis
             
-            # Determine if we need RAG
-            try:
-                needs_retrieval = force_rag or self._check_if_needs_retrieval(processed_query, analysis)
-                if needs_retrieval and index:
-                    # Validate retrieval configuration
-                    retrieval_config = self.query_config.get('retrieval')
-                    if not retrieval_config:
-                        logging.warning("Retrieval configuration is missing, using defaults")
-                        retrieval_config = {
-                            'rerank_top_k': 10,
-                            'hybrid_search_weights': {
-                                'bm25': 0.4,
-                                'vector': 0.4,
-                                'keyword': 0.2
-                            }
-                        }
-                    
-                    # Use hybrid retrieval with configured weights
+            # Determine the index to use: session index > stored index
+            active_index = index if index else self.index
+            
+            # Determine if RAG is needed
+            analysis_needs_retrieval = self._check_if_needs_retrieval(processed_query, analysis)
+            use_rag = force_rag or analysis_needs_retrieval
+            
+            logging.info(f"Force RAG: {force_rag}, Analysis needs retrieval: {analysis_needs_retrieval}, Use RAG: {use_rag}")
+
+            if use_rag:
+                if active_index:
+                    logging.info("Attempting RAG query.")
+                    # RAG Path
+                    retrieval_config = self.query_config.get('retrieval', {})
                     hybrid_retriever = HybridRetriever(
-                        index,
+                        active_index,
                         top_k=retrieval_config.get('rerank_top_k', 10),
                         weights=retrieval_config.get('hybrid_search_weights', {
-                            'bm25': 0.4,
-                            'vector': 0.4,
-                            'keyword': 0.2
+                            'bm25': 0.4, 'vector': 0.4, 'keyword': 0.2
                         })
                     )
                     
                     retrieved_nodes = hybrid_retriever.retrieve(processed_query)
-                    if not retrieved_nodes:
-                        logging.warning("No documents retrieved, falling back to direct query")
-                        return self.direct_query(processed_query, provider_name, prompt_type, persona), True, {"rag_status": "No relevant documents found"}
                     
-                    # Process with RAG
-                    response = self.query_with_rag(
-                        processed_query, retrieved_nodes, provider_name,
-                        prompt_type, persona, max_output_tokens
-                    )
-                    analysis['rag_status'] = "Using hybrid retrieval for comprehensive results"
+                    if retrieved_nodes:
+                        logging.info(f"Retrieved {len(retrieved_nodes)} nodes.")
+                        response = self.query_with_rag(
+                            processed_query, retrieved_nodes, provider_name,
+                            prompt_type, persona, max_output_tokens
+                        )
+                        analysis['rag_status'] = "Used RAG (Hybrid Retrieval)"
+                    else:
+                        logging.warning("RAG needed but no relevant documents found. Falling back to direct query.")
+                        response = self.direct_query(processed_query, provider_name, prompt_type, persona)
+                        analysis['rag_status'] = "RAG Attempted - No Docs Found (Fallback Direct)"
                 else:
-                    # Direct query without retrieval
-                    response = self.direct_query(
-                        processed_query, provider_name,
-                        prompt_type, persona
-                    )
-                    analysis['rag_status'] = "Direct query"
-                
-                return response, True, analysis
-                
-            except Exception as e:
-                logging.error(f"Error in retrieval process: {str(e)}\n{traceback.format_exc()}")
-                return f"Error in retrieval process: {str(e)}", False, {}
+                    # RAG needed but no index available (neither session nor stored)
+                    logging.warning("RAG needed but no index available. Falling back to direct query.")
+                    response = self.direct_query(processed_query, provider_name, prompt_type, persona)
+                    analysis['rag_status'] = "RAG Needed - No Index (Fallback Direct)"
+            else:
+                # Direct Query Path
+                logging.info("Executing direct query.")
+                response = self.direct_query(processed_query, provider_name, prompt_type, persona)
+                analysis['rag_status'] = "Direct Query"
+            
+            return response, True, analysis
             
         except Exception as e:
             logging.error(f"Error processing query: {str(e)}\n{traceback.format_exc()}")
@@ -122,15 +117,20 @@ class QueryEngine:
     
     def query_with_rag(self, query: str, retrieved_nodes: List, provider_name: str,
                       prompt_type: str, persona: Optional[str], max_output_tokens: int) -> str:
-        """Process query with RAG using enhanced retrieval."""
+        """Process query with RAG using retrieved documents."""
         try:
+            logging.debug(f"Processing RAG query: {query}")
             if not retrieved_nodes:
-                return "No relevant documents found"
+                logging.warning("query_with_rag called with no retrieved nodes.")
+                return "No relevant context found to answer the query."
                 
             # Extract text from retrieved nodes
-            documents = [node.text for node in retrieved_nodes if hasattr(node, 'text')]
+            documents = [node.text for node in retrieved_nodes if hasattr(node, 'text') and node.text]
             if not documents:
-                return "Error: Retrieved nodes have no text content"
+                logging.error("Retrieved nodes have no valid text content.")
+                return "Error: Retrieved context is empty or invalid."
+            
+            logging.debug(f"Extracted {len(documents)} text segments from nodes.")
             
             # Process documents using context handler
             if self.context_handler:
@@ -139,8 +139,10 @@ class QueryEngine:
                     documents=documents,
                     max_output_tokens=max_output_tokens
                 )
+                logging.debug(f"Processed context length: {len(context)} chars")
             else:
                 context = "\n".join(documents)
+                logging.warning("Context handler not available, using raw concatenated documents.")
             
             # Get response using prompt manager
             response = self.prompt_manager.get_response(
@@ -150,6 +152,7 @@ class QueryEngine:
                 prompt_type=prompt_type,
                 persona=persona
             )
+            logging.debug("Received response from prompt manager.")
             
             return response
             
@@ -158,17 +161,19 @@ class QueryEngine:
             return f"Error in RAG processing: {str(e)}"
     
     def direct_query(self, query: str, provider_name: str,
-                    prompt_type: str, persona: Optional[str]) -> str:
+                    prompt_type: str, persona: Optional[str], max_output_tokens: int = 500) -> str: # Added max_output_tokens
         """Process query without retrieval."""
         try:
+            logging.debug(f"Processing direct query: {query}")
             # Get response using prompt manager
             response = self.prompt_manager.get_response(
                 query=query,
-                context="",
+                context="", # No context for direct query
                 provider_name=provider_name,
                 prompt_type=prompt_type,
                 persona=persona
             )
+            logging.debug("Received response from prompt manager for direct query.")
             
             return response
             
@@ -178,16 +183,19 @@ class QueryEngine:
     
     def _check_if_needs_retrieval(self, query: str, analysis: Dict) -> bool:
         """Determine if query needs retrieval based on analysis."""
-        if not analysis:
-            return False
-            
-        # Check various factors that might indicate retrieval is needed
-        needs_retrieval = (
-            analysis.get('requires_calculation', False) or
-            analysis.get('is_comparison', False) or
-            analysis.get('time_sensitive', False) or
-            len(analysis.get('companies_mentioned', [])) > 0 or
-            analysis.get('requires_specific_info', False)
-        )
+        # Simplified check: if analysis contains certain keys indicating complexity or need for specific data
+        retrieval_indicators = [
+            'requires_calculation',
+            'is_comparison',
+            'time_sensitive',
+            'requires_specific_info'
+        ]
         
+        needs_retrieval = any(analysis.get(key, False) for key in retrieval_indicators)
+        
+        # Also consider if companies are mentioned
+        if len(analysis.get('companies_mentioned', [])) > 0:
+            needs_retrieval = True
+            
+        logging.debug(f"Checking retrieval need for query: '{query}'. Analysis: {analysis}. Needs retrieval: {needs_retrieval}")
         return needs_retrieval 
