@@ -6,6 +6,13 @@ from llama_index.core import Settings
 import re
 from llm_providers import get_llm_provider
 import json
+import logging
+from openai import OpenAI
+from dotenv import load_dotenv
+import os
+
+logger = logging.getLogger(__name__)
+load_dotenv()
 
 class QueryPreprocessor:
     """Preprocesses queries for enhanced understanding and retrieval."""
@@ -14,7 +21,12 @@ class QueryPreprocessor:
         """Initialize the query preprocessor with necessary tools."""
         self.config = config_loader
         self.spell_checker = SpellChecker()
-        
+        self.llm = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+        if not self.llm:
+            logger.warning("QueryPreprocessor initialized without an LLM provider. LLM-based features will be disabled.")
         # Load English language model for NLP tasks
         try:
             self.nlp = spacy.load("en_core_web_sm")
@@ -34,7 +46,8 @@ class QueryPreprocessor:
         
     def enhance_query(self, query: str) -> str:
         """Enhance query using instruction-based LLM."""
-        if not Settings.llm:
+        if not self.llm:
+            logger.warning("LLM enhancement skipped: LLM not available.")
             return query
             
         enhancement_prompt = f"""As a financial query enhancement system, improve the following query while maintaining its core intent.
@@ -51,8 +64,13 @@ class QueryPreprocessor:
         Enhanced query:"""
                 
         try:
-            response = Settings.llm.complete(enhancement_prompt)
-            enhanced_query = response.text.strip()
+            # Format the prompt correctly for the chat completions API
+            messages = [{"role": "user", "content": enhancement_prompt}]
+            response = self.llm.chat.completions.create(
+                        model="deepseek/deepseek-chat-v3-0324", # Correct model name as per previous request
+                        messages=messages # Pass the formatted messages list
+                        )
+            enhanced_query = response.choices[0].message.content
             print("query after enhancement", enhanced_query)
             return enhanced_query if enhanced_query else query
         except:
@@ -69,7 +87,8 @@ class QueryPreprocessor:
         - requires_retrieval: bool
         - llm_analysis: str
         """
-        if not Settings.llm:
+        logger.info("Analyzing query intent using LLM.")
+        if not self.llm:
             return self._basic_intent_analysis(query)
             
         analysis_prompt = f"""Analyze the following financial query and provide structured information about its intent and requirements.
@@ -86,8 +105,13 @@ class QueryPreprocessor:
         Provide analysis in a clear, structured format."""
         
         try:
-            response = Settings.llm.complete(analysis_prompt)
-            llm_analysis = response.text.strip()
+             # Format the prompt correctly for the chat completions API
+            messages = [{"role": "user", "content": analysis_prompt}]
+            response = self.llm.chat.completions.create(
+                        model="deepseek/deepseek-chat-v3-0324", # Correct model name
+                        messages=messages # Pass the formatted messages list
+                        )
+            llm_analysis = response.choices[0].message.content.strip()
             
             # Combine LLM analysis with basic NLP analysis
             basic_analysis = self._basic_intent_analysis(query)
@@ -98,6 +122,7 @@ class QueryPreprocessor:
             
     def _basic_intent_analysis(self, query: str) -> Dict:
         """Perform basic intent analysis using spaCy."""
+        logger.info("Performing basic intent analysis using spaCy.")
         doc = self.nlp(query)
         
         return {
@@ -124,31 +149,60 @@ class QueryPreprocessor:
             "format": "Respond with a JSON object containing: {needs_retrieval: boolean, reason: string}"
         }
         
+        # Format the prompt correctly for the chat completions API
+        analysis_prompt_str = json.dumps(analysis_prompt)
+        messages = [{"role": "user", "content": analysis_prompt_str}]
+
         try:
-            # Use OpenAI for consistent results
-            llm = get_llm_provider("openai")
-            response = llm.generate_response(
-                json.dumps(analysis_prompt),
-                temperature=0.1,
-                max_tokens=100
-            )
-            
-            # Parse the response
-            result = json.loads(response)
-            return result.get('needs_retrieval', False), result.get('reason', '')
+            # Use OpenAI client syntax for consistent results
+            response = self.llm.chat.completions.create(
+                        model="deepseek/deepseek-chat-v3-0324", # Correct model name
+                        messages=messages
+                        )
+            result_str = response.choices[0].message.content
+            # Clean potential markdown fences from the response
+            if result_str.startswith("```json"):
+                result_str = result_str[7:] # Remove ```json\n
+            if result_str.startswith("```"): # Handle case where only ``` is present
+                 result_str = result_str[3:]
+            if result_str.endswith("```"):
+                result_str = result_str[:-3] # Remove trailing ```
+            result_str = result_str.strip() # Strip again after removing fences
+
+            # Attempt to parse the potentially cleaned JSON response
+            try:
+                result = json.loads(result_str)
+                # Ensure expected keys exist, provide defaults if not
+                needs_retrieval = result.get('needs_retrieval', False)
+                reason = result.get('reason', 'LLM analysis successful, reason not specified.')
+                # Basic validation - check if needs_retrieval is actually a boolean
+                if not isinstance(needs_retrieval, bool):
+                    logger.warning(f"LLM returned non-boolean for needs_retrieval: {needs_retrieval}. Defaulting to False.")
+                    needs_retrieval = False
+                    reason = f"LLM analysis returned invalid format: {result_str}"
+                return needs_retrieval, reason
+            except json.JSONDecodeError:
+                logger.warning(f"LLM response was not valid JSON: {result_str}. Falling back to basic heuristics.")
+                # Fallback if JSON parsing fails
+                doc = self.nlp(query)
+                fallback_needs_retrieval = any(token.text.lower() in ['how', 'what', 'why', 'explain', 'analyze', 'describe'] for token in doc)
+                return fallback_needs_retrieval, f"Fallback due to invalid JSON response from LLM: {result_str}"
             
         except Exception as e:
-            print(f"Error in LLM retrieval analysis: {str(e)}")
+            logger.error(f"Error in LLM retrieval analysis: {str(e)}") # Use logger.error
             # Fallback to basic heuristics if LLM fails
             doc = self.nlp(query)
-            return any(token.text.lower() in ['how', 'what', 'why', 'explain', 'analyze', 'describe'] 
+            fallback_needs_retrieval = any(token.text.lower() in ['how', 'what', 'why', 'explain', 'analyze', 'describe'] 
                       for token in doc)
+            # Return tuple in fallback case as well
+            return fallback_needs_retrieval, f"Fallback due to LLM API error: {str(e)}"
         
     def preprocess_query(self, query: str) -> Tuple[str, Dict]:
         """Complete query preprocessing pipeline."""
         # Enhance query using instruction-based LLM
+        logger.info("Enhancing query using instruction-based LLM.")
         enhanced_query = self.enhance_query(query)
-        
+        logger.info("Enhanced query successfully")
         # Analyze query intent
         analysis = self.analyze_query_intent(enhanced_query)
         

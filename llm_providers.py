@@ -1,35 +1,22 @@
 from typing import Optional, Dict, Any
 import os
 from abc import ABC, abstractmethod
-from openai import OpenAI, APIError, RateLimitError, APIConnectionError, AuthenticationError, OpenAIError
+import openai
 import requests
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 import tiktoken
+import logging
+from llama_index.llms.openai import OpenAI
+from llama_index.llms.huggingface import HuggingFaceLLM
+from llama_index.llms.openrouter import OpenRouter
+from transformers import BitsAndBytesConfig
+from llama_index.core.llms import LLM
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-def truncate_prompt(text: str, max_tokens: int, model: str = "gpt-3.5-turbo") -> str:
-    """Truncate text to fit within token limit."""
-    try:
-        if model.startswith("gpt"):
-            encoding = tiktoken.encoding_for_model(model)
-        else:
-            encoding = tiktoken.get_encoding("cl100k_base")  # Default for other models
-            
-        tokens = encoding.encode(text)
-        if len(tokens) <= max_tokens:
-            return text
-            
-        # Leave some room for the response and system message
-        truncated_tokens = tokens[:max_tokens - 1000]
-        return encoding.decode(truncated_tokens)
-    except Exception as e:
-        print(f"Error in truncation: {str(e)}")
-        # Fallback to simple character-based truncation
-        char_per_token = 4  # Rough estimate
-        safe_length = (max_tokens - 1000) * char_per_token
-        return text[:safe_length]
 
 class BaseLLMProvider(ABC):
     @abstractmethod
@@ -51,11 +38,8 @@ class OpenAIProvider(BaseLLMProvider):
 
     def generate_response(self, prompt: str, **kwargs) -> str:
         try:
-            # Truncate prompt if needed
-            truncated_prompt = truncate_prompt(prompt, self.max_tokens, self.model)
-            
             # Prepare messages with system prompt if provided
-            messages = [{"role": "user", "content": truncated_prompt}]
+            messages = [{"role": "user", "content": prompt}]
             if kwargs.get('system_prompt'):
                 messages.insert(0, {"role": "system", "content": kwargs['system_prompt']})
                 
@@ -64,7 +48,7 @@ class OpenAIProvider(BaseLLMProvider):
                 model=self.model,
                 messages=messages,
                 temperature=kwargs.get('temperature', 0.1),
-                max_tokens=kwargs.get('max_output_tokens', 500)  # Use the max_output_tokens from kwargs
+                max_tokens=kwargs.get('max_output_tokens', 2000)  # Use the max_output_tokens from kwargs
             )
             return response.choices[0].message.content
             
@@ -93,17 +77,15 @@ class HuggingFaceProvider(BaseLLMProvider):
 
     def generate_response(self, prompt: str, **kwargs) -> str:
         try:
-            # Truncate prompt if needed
-            truncated_prompt = truncate_prompt(prompt, self.max_tokens)
-            
+
             # Format prompt for instruction-tuned models
-            formatted_prompt = f"""<s>[INST] {truncated_prompt} [/INST]"""
+            formatted_prompt = f"""<s>[INST] {prompt} [/INST]"""
             
             response = self.client.text_generation(
                 formatted_prompt,
                 model=self.model,
                 temperature=kwargs.get('temperature', 0.1),
-                max_new_tokens=kwargs.get('max_output_tokens', 512),  # Use the max_output_tokens from kwargs
+                max_new_tokens=kwargs.get('max_output_tokens', 2000),  # Use the max_output_tokens from kwargs
                 repetition_penalty=1.1
             )
             return response
@@ -120,9 +102,7 @@ class OpenRouterProvider(BaseLLMProvider):
 
     def generate_response(self, prompt: str, **kwargs) -> str:
         try:
-            # Truncate prompt if needed
-            truncated_prompt = truncate_prompt(prompt, self.max_tokens)
-            
+
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "HTTP-Referer": "http://localhost:8501",
@@ -131,7 +111,7 @@ class OpenRouterProvider(BaseLLMProvider):
                 "OpenRouter-Referrer": "http://localhost:8501",
             }
             
-            messages = [{"role": "user", "content": truncated_prompt}]
+            messages = [{"role": "user", "content": prompt}]
             if kwargs.get('system_prompt'):
                 messages.insert(0, {"role": "system", "content": kwargs['system_prompt']})
             
@@ -139,7 +119,7 @@ class OpenRouterProvider(BaseLLMProvider):
                 "model": self.model,
                 "messages": messages,
                 "temperature": kwargs.get('temperature', 0.1),
-                "max_tokens": kwargs.get('max_output_tokens', 1000),  # Use the max_output_tokens from kwargs
+                "max_tokens": kwargs.get('max_output_tokens', 2000),  # Use the max_output_tokens from kwargs
             }
             
             response = requests.post(
@@ -168,24 +148,153 @@ class OpenRouterProvider(BaseLLMProvider):
         except Exception as e:
             return f"OpenRouter Error: {str(e)}"
 
-def get_llm_provider(provider_name: str) -> Optional[BaseLLMProvider]:
-    providers = {
-        'openai': (OpenAIProvider, 'OPENAI_API_KEY', 'gpt-3.5-turbo'),
-        'huggingface': (HuggingFaceProvider, 'HUGGINGFACE_API_KEY', 'mistralai/Mixtral-8x7B-Instruct-v0.1'),
-        'openrouter': (OpenRouterProvider, 'OPENROUTER_API_KEY', 'mistralai/mixtral-8x7b-instruct')
+# Modified get_llm_provider signature and logic (DEPRECATED)
+"""
+
+
+def get_llm_provider(provider_name: str, model_name: str) -> Optional[BaseLLMProvider]:
+    '''
+    Gets an initialized LLM provider instance for the specified provider and model.
+
+    Args:
+        provider_name (str): The name of the provider (e.g., 'openai', 'huggingface').
+        model_name (str): The specific model identifier for the provider.
+        temperature (float): The temperature setting for the LLM.
+
+    Returns:
+        Optional[BaseLLMProvider]: An initialized provider instance or None on failure.
+    '''
+    providers_config = {
+        'openai': {
+            'class': OpenAIProvider,
+            'api_key_name': 'OPENAI_API_KEY'
+        },
+        'huggingface': {
+            'class': HuggingFaceProvider,
+            'api_key_name': 'HUGGINGFACE_API_KEY'
+            # Note: HuggingFace model might be passed differently or validated against allowed models if needed
+        },
+        'openrouter': {
+            'class': OpenRouterProvider,
+            'api_key_name': 'OPENROUTER_API_KEY'
+        }
     }
 
-    if provider_name not in providers:
+    if provider_name not in providers_config:
+        logger.error(f"Unsupported provider name: {provider_name}")
         return None
 
-    ProviderClass, api_key_name, default_model = providers[provider_name]
+    config = providers_config[provider_name]
+    ProviderClass = config['class']
+    api_key_name = config['api_key_name']
     api_key = os.getenv(api_key_name)
-    
+
     if not api_key:
-        raise ValueError(f"Please set {api_key_name} in your .env file")
-    
+        logger.error(f"API key {api_key_name} not found in environment variables.")
+        # Optionally show error in UI if called from Streamlit context, otherwise just log
+        # st.error(f"API Key for {provider_name.capitalize()} ({api_key_name}) is missing!")
+        return None # Return None to indicate failure
+
     try:
-        return ProviderClass(api_key, default_model)
+        logger.info(f"Initializing {provider_name} provider with model '{model_name}'")
+        # Pass the specific model_name and temperature during initialization
+        return ProviderClass(api_key=api_key, model=model_name)
     except Exception as e:
-        print(f"Error initializing {provider_name} provider: {str(e)}")
-        return None 
+        logger.error(f"Error initializing {provider_name} provider with model {model_name}: {e}", exc_info=True)
+        # Optionally show error in UI
+        # st.error(f"Failed to initialize {provider_name.capitalize()} provider: {e}")
+        return None
+"""
+
+def get_llm_provider(provider_name: str,
+                     model_name: str,
+                     temperature: Optional[float] = 0.1, # Optional temperature
+                     max_tokens: Optional[int] = 512     # Optional max_tokens
+                     ) -> Optional[LLM]:
+    """
+    Gets an initialized LlamaIndex LLM instance for the specified provider and model.
+
+    Args:
+        provider_name (str): The name of the provider ('openai', 'huggingface', 'openrouter').
+        model_name (str): The specific model identifier for the provider.
+        temperature (float): The default temperature setting for the LLM.
+        max_tokens (int): The default maximum number of tokens to generate.
+
+    Returns:
+        Optional[LLM]: An initialized LlamaIndex LLM instance or None on failure.
+    """
+    provider_name = provider_name.lower() # Normalize name
+    llm_instance: Optional[LLM] = None
+
+    try:
+        if provider_name == 'openai':
+            api_key = os.getenv('OPENAI_API_KEY')
+            openai.api_key = api_key
+            if not api_key:
+                logger.error("API key OPENAI_API_KEY not found in environment variables.")
+                return None
+            logger.info(f"Initializing LlamaIndex OpenAI provider with model '{model_name}'")
+            llm_instance = OpenAI(
+                model=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens # Corresponds to max_tokens in OpenAI API
+            )
+            # when use it can either llm_instance.stream() or llm_instance.complete()
+
+        elif provider_name == 'huggingface':
+            # Using HuggingFaceInferenceAPI which requires an API Token (key)
+            api_key_huggingface = os.getenv('HUGGINGFACE_API_KEY')
+            if not api_key_huggingface:
+                logger.error("API key HUGGINGFACE_API_KEY not found for HuggingFace Inference API.")
+                return None
+            logger.info(f"Initializing LlamaIndex HuggingFace Inference API provider with model '{model_name}'")
+
+            # quantize to save memory
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+            llm_instance = HuggingFaceLLM(
+                token=api_key_huggingface, # Parameter name is 'token' for HF API Key
+                model_name=model_name,
+                temperature=temperature,
+                max_new_tokens=max_tokens # Parameter name is 'max_new_tokens'
+                # Add other params like context_window if needed, e.g., context_window=3900
+            )
+            # when use it will be llm_instance.complete()
+
+        elif provider_name == 'openrouter':
+            api_key_openrouter = os.getenv('OPENROUTER_API_KEY')
+            if not api_key_openrouter:
+                logger.error("API key OPENROUTER_API_KEY not found in environment variables.")
+                return None
+            logger.info(f"Initializing LlamaIndex OpenRouter provider with model '{model_name}'")
+            llm_instance = OpenRouter(
+                api_key=api_key_openrouter,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens # Corresponds to max_tokens in OpenRouter API
+                # Add other params like context_window if needed, e.g., context_window=4096
+            )
+
+        else:
+            logger.error(f"Unsupported provider name: {provider_name}")
+            return None
+
+        # Basic check to ensure the model was initialized
+        if llm_instance:
+             # You could add a simple test call here if desired, e.g., llm_instance.complete("test")
+             # but it might incur cost/time, so maybe skip it.
+             logger.info(f"Successfully initialized LlamaIndex {provider_name} provider.")
+             return llm_instance
+        else:
+             # This case should ideally be caught by specific provider checks, but as a fallback:
+             logger.error(f"Failed to initialize LlamaIndex {provider_name} provider for unknown reasons.")
+             return None
+
+    except Exception as e:
+        # Log the full exception details
+        logger.error(f"Error initializing LlamaIndex {provider_name} provider with model {model_name}: {e}", exc_info=True)
+        return None

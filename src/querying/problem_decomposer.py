@@ -1,10 +1,19 @@
 from typing import List, Dict
 from llama_index.core import Settings
+from openai import OpenAI
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class ProblemDecomposer:
     """Decomposes complex queries into sub-problems for better analysis."""
     
     def __init__(self):
+        self.llm = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
         self.decomposition_prompt = """Analyze the following financial query and break it down into sub-problems.
         For each sub-problem, identify:
         1. The specific aspect being asked
@@ -17,7 +26,7 @@ class ProblemDecomposer:
     
     def decompose_query(self, query: str) -> Dict:
         """Decompose a query into sub-problems using LLM."""
-        if not Settings.llm:
+        if not self.llm:
             return {
                 'original_query': query,
                 'sub_problems': [{'query': query, 'dependencies': [], 'required_info': []}]
@@ -26,9 +35,12 @@ class ProblemDecomposer:
         try:
             # Get LLM decomposition
             prompt = self.decomposition_prompt.format(query=query)
-            response = Settings.llm.complete(prompt)
-            decomposition = response.text.strip()
-            print("query after decomposition", query)
+            response = self.llm.chat.completions.create(
+                        model="deepseek/deepseek-chat-v3-0324",
+                        messages= prompt
+                        )
+            decomposition = response.choices[0].message.content.strip()
+            print("query after decomposition", decomposition)
             # Parse the decomposition into structured format
             sub_problems = self._parse_decomposition(decomposition)
             

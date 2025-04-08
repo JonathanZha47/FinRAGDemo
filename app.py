@@ -1,7 +1,6 @@
 import streamlit as st
 import os
 import logging
-from utils import process_documents, get_response
 import tempfile
 from dotenv import load_dotenv
 from src.config.config_loader import ConfigLoader
@@ -18,6 +17,9 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.extractors import TitleExtractor
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core import Settings
+from llm_providers import get_llm_provider
+from llama_index.core.query_engine import RetrieverQueryEngine
 
 # --- Configure Logging --- 
 # Set root logger level - Note: Streamlit might interfere slightly, 
@@ -45,10 +47,16 @@ logger.info("Environment variables loaded.")
 
 # Initialize configuration
 config_loader = ConfigLoader()
+# get UI config
+# including temperature, top_k, chunk_size, max_tokens, output_tokens, and llm_providers
 ui_config = config_loader.get_ui_config()
 
 # Load and verify API keys
 openai_key = os.getenv("OPENAI_API_KEY")
+# Check specifically if OpenAI key exists for the embedding model
+if not openai_key:
+    st.error("OpenAI API Key (OPENAI_API_KEY) is missing in your environment variables. Required for embeddings.")
+    st.stop() # Stop the app if key is missing
 huggingface_key = os.getenv("HUGGINGFACE_API_KEY") 
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
 
@@ -68,18 +76,19 @@ if openrouter_key:
 else:
     logger.warning("⚠️ OpenRouter API Key is missing! Check your .env file.")
 
-# Available LLM providers
-LLM_PROVIDERS = {
-    "OpenAI (GPT-3.5-turbo)": "openai",
-    "HuggingFace (Mixtral-8x7B)": "huggingface",
-    "OpenRouter (Mixtral-8x7B)": "openrouter"
-}
-
 st.set_page_config(
     page_title="Financial Advisor Bot",
     page_icon="💰",
     layout="wide"
 )
+
+# --- LlamaIndex Global Settings --- (Optional but recommended)
+# Set embedding model globally if desired (requires API key to be available)
+Settings.embed_model = OpenAIEmbedding()
+logger.info("LlamaIndex Settings.embed_model configured globally.")
+# Set LLM globally if used by extractors (like TitleExtractor)
+# Settings.llm = get_llm_provider(provider_name, model_name) # Requires provider/model selection
+# --- End Global Settings ---
 
 def save_uploaded_file(uploaded_file):
     """Saves uploaded file to the data directory."""
@@ -110,15 +119,13 @@ def sidebar_settings(ui_config: dict):
     )
     
     # Model Selection based on provider
-    available_models = ui_config['available_models'][provider_name]
+    available_models = ui_config['llm_providers'][provider_name]
     model = st.sidebar.selectbox(
         "Select Model",
         options=available_models,
         index=0
     )
     
-    # Get output token range for selected model
-    output_token_range = ui_config.get('output_tokens_range', {}).get(provider_name, {}).get(model, [1, 2048, 50])
     
     # Prompt Engineering Settings
     st.sidebar.subheader("Prompt Engineering")
@@ -153,6 +160,14 @@ def sidebar_settings(ui_config: dict):
         step=ui_config['top_k_range'][2]
     )
     
+    # Retriever Selection
+    retriever_type = st.sidebar.selectbox(
+        "Select Retriever Type",
+        options=["Vector", "BM25", "Hybrid Fusion", "Auto-Merging"], # Add more if implemented
+        index=0, # Default to Vector
+        help="Choose the method for retrieving relevant documents."
+    )
+    
     chunk_size = st.sidebar.slider(
         "Chunk Size",
         min_value=ui_config['chunk_size_range'][0],
@@ -171,6 +186,8 @@ def sidebar_settings(ui_config: dict):
         step=ui_config['temperature_range'][2]
     )
     
+    # Get output token range for selected model
+    output_token_range = ui_config.get('output_tokens_range', {}).get(provider_name, {}).get(model, [1, 2048, 50])
     # Dynamic max output tokens slider based on model
     max_output_tokens = st.sidebar.slider(
         "Max Output Tokens",
@@ -190,6 +207,7 @@ def sidebar_settings(ui_config: dict):
         "enable_hallucination_check": enable_hallucination_check,
         "enable_guardrails": enable_guardrails,
         "top_k": top_k,
+        "retriever_type": retriever_type,
         "chunk_size": chunk_size,
         "temperature": temperature,
         "max_output_tokens": max_output_tokens
@@ -314,30 +332,30 @@ def main():
     
     # Get settings from sidebar
     settings = sidebar_settings(ui_config)
-    
+    # get LLM
+    llm = get_llm_provider(settings["provider_name"], settings["model"], settings["temperature"], settings["max_output_tokens"])
+
     # Initialize core components (consider making QueryEngine singleton if needed)
     document_loader = DocumentLoader(config_loader)
     storage_manager = StorageManager(config_loader)
-    query_engine = QueryEngine(config_loader) # Loads index on init now
+    query_engine = QueryEngine(llm, config_loader) # Loads index on init now
     prompt_manager = PromptManager(config_loader)
     
+  
+
     # --- Ingestion Pipeline Setup --- 
     # Define transformations based on settings or config
     # Using OpenAIEmbedding, assuming OPENAI_API_KEY is set
     transformations = [
         SentenceSplitter(chunk_size=settings['chunk_size'], chunk_overlap=20),
-        OpenAIEmbedding() # Ensure API key is available
+        Settings.embed_model # Use the globally set embedding model
+        # Add TitleExtractor back if needed and Settings.llm is configured
+        # TitleExtractor(llm=Settings.llm), 
     ]
     
-    # Get storage context (points to the persistent vector store)
-    storage_context = StorageContext.from_defaults(persist_dir=storage_manager.persist_dir)
-    
-    # Create the pipeline
-    pipeline = IngestionPipeline(
-        transformations=transformations,
-        vector_store=storage_context.vector_store # Use the store from context
-    )
-    logger.info(f"Ingestion pipeline initialized to use vector store at: {storage_manager.persist_dir}")
+    # Create the pipeline *without* a vector_store for transformations only
+    pipeline = IngestionPipeline(transformations=transformations)
+    logger.info("Ingestion pipeline (transformations only) initialized.")
     # --- End Pipeline Setup --- 
 
     # File upload section
@@ -371,24 +389,37 @@ def main():
                              st.warning(f"Could not load content from {os.path.basename(file_path)}")
                 
                 if all_raw_docs:
-                    with st.spinner(f"Running ingestion pipeline for {len(all_raw_docs)} document sections..."):
+                    with st.spinner(f"Running ingestion transformations for {len(all_raw_docs)} document sections..."):
                         try:
-                            # Run the pipeline
-                            pipeline.run(documents=all_raw_docs)
-                            logger.info(f"Ingestion pipeline completed for {len(saved_file_paths)} files.")
+                            nodes = pipeline.run(documents=all_raw_docs)
+                            logger.info(f"Pipeline transformations completed, generated {len(nodes)} nodes.")
                             
-                            # IMPORTANT: Update QueryEngine's index reference
-                            logger.info("Reloading index for Query Engine...")
-                            reloaded_index = storage_manager.load_index()
-                            if reloaded_index:
-                                query_engine.update_index(reloaded_index)
-                                st.success(f"Successfully processed and indexed {len(saved_file_paths)} document(s)!")
+                            if not nodes:
+                                 st.error("Pipeline ran but generated no nodes. Check transformations (e.g., chunk size) and input documents.")
+                                 return # Stop processing if no nodes
+                        
+                            # 5. Create Index from Nodes using the prepared Storage Context
+                            logger.info("Creating VectorStoreIndex from generated nodes with the prepared storage context...")
+                            index = VectorStoreIndex(nodes=nodes, show_progress=True)
+                            logger.info(f"Index created and associated with storage context for dir: {storage_manager.persist_dir}")
+                            
+                            # 6. Persist Index (using StorageManager)
+                            logger.info(f"Persisting index to {storage_manager.persist_dir}...")
+                            # Use the storage_manager's save function which handles directory creation etc.
+                            save_successful = storage_manager.save_index(index) 
+                            # index.storage_context.persist(persist_dir=storage_manager.persist_dir) # Old direct way
+                            
+                            if save_successful:
+                                # 7. Update Query Engine with the NEW index
+                                logger.info("Updating Query Engine with the newly created index.")
+                                query_engine.add_nodes_to_index(nodes)
+                                st.success(f"Successfully processed, indexed, and persisted {len(saved_file_paths)} document(s)!")
                             else:
-                                st.error("Pipeline ran, but failed to reload the updated index.")
+                                 st.error("Index created, but failed to persist it to disk.")
                                 
                         except Exception as pipe_err:
-                            logger.error(f"Ingestion pipeline failed: {pipe_err}", exc_info=True)
-                            st.error(f"Error during document processing pipeline: {pipe_err}")
+                            logger.error(f"Ingestion pipeline/indexing failed: {pipe_err}", exc_info=True)
+                            st.error(f"Error during document processing or indexing: {pipe_err}")
                 else:
                     st.error("No content could be extracted from the uploaded files.")
             else:
@@ -402,16 +433,19 @@ def main():
     
     if query:
         with st.spinner("Processing query..."):
+
+
             # Process query - Pass None for index, QE uses its internal one
             response, success, analysis = query_engine.process_query(
                 query=query,
-                index=None, # QueryEngine uses its own loaded index
+                index=storage_manager.load_index(), 
                 provider_name=settings["provider_name"],
                 model_name=settings["model"],
+                retriever_type=settings["retriever_type"],
                 force_rag=force_rag,
                 prompt_type=settings["prompt_type"],
-                persona=settings["persona"],
-                max_output_tokens=settings["max_output_tokens"]
+                top_k=settings["top_k"],
+                persona=settings["persona"]
             )
             
             results_container = st.container()
@@ -462,6 +496,7 @@ def main():
                     
                     st.write("\n**Generation Settings:**")
                     st.write("RAG Status:", rag_status)
+                    st.write("Retriever Type:", settings["retriever_type"])
                     st.write("Model:", settings["model"])
                     st.write("Temperature:", settings["temperature"])
                     st.write("Prompt Type:", settings["prompt_type"])

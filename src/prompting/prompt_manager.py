@@ -1,5 +1,8 @@
 from typing import Dict, List, Optional
 from src.config.config_loader import ConfigLoader
+import logging
+
+logger = logging.getLogger(__name__)
 
 class PromptManager:
     """Manages different prompt engineering techniques and verification."""
@@ -77,7 +80,104 @@ class PromptManager:
         prompt += "Ensure your response reflects your professional perspective and expertise."
         
         return prompt
-        
+
+    # --- NEW: Method for RAG templates compatible with LlamaIndex ---
+    def get_rag_prompt_template(self, prompt_type: str, persona: Optional[str], query: str) -> str:
+        """
+        Returns a LlamaIndex-compatible QA prompt template string
+        with {context_str} and {query_str} placeholders, incorporating
+        different prompting strategies.
+        """
+        logger.debug(f"Generating RAG prompt template for type: {prompt_type}, persona: {persona}")
+
+        # --- Define Structure Placeholders ---
+        # These are standard placeholders expected by LlamaIndex ResponseSynthesizer
+        context_placeholder = "{context_str}"
+        query_placeholder = "{query_str}" # Use the query passed for few-shot examples if needed
+
+        # --- Base Instruction ---
+        base_instruction = f"Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer. Provide a detailed and factual response based *only* on the context provided.\n\nContext:\n---------------------\n{context_placeholder}\n---------------------\n\n"
+        final_query_instruction = f"Question: {query_placeholder}\nAnswer:"
+
+        # --- Strategy-Specific Prefixes/Suffixes ---
+        persona_prefix = ""
+        cot_prefix = ""
+        few_shot_prefix = ""
+
+        # 1. Persona Logic
+        if prompt_type == "Persona" and persona:
+            selected_persona = self.personas.get(persona)
+            if selected_persona:
+                 persona_prefix = f"{selected_persona}\nBased on your role and the context provided below:\n"
+                 logger.debug(f"Applied persona: {persona}")
+            else:
+                 logger.warning(f"Persona '{persona}' not found, using default.")
+                 persona_prefix = f"{self.personas.get('financial_advisor', 'You are a helpful AI assistant.')}\nBased on your role and the context provided below:\n"
+        elif prompt_type == "Persona": # Persona selected but value is None/empty
+             logger.warning("Persona prompt type selected but no persona provided, using default.")
+             persona_prefix = f"{self.personas.get('financial_advisor', 'You are a helpful AI assistant.')}\nBased on your role and the context provided below:\n"
+
+
+        # 2. Few-Shot Logic (Inject before main instruction)
+        if prompt_type == "Few-Shot" and self.few_shot_examples:
+             few_shot_prefix = "Here are some examples of how to answer financial questions:\n\n"
+             for example in self.few_shot_examples:
+                  # Note: These examples don't use the {context_str} for the current query
+                  few_shot_prefix += f"Example Question: {example['question']}\nExample Answer: {example['answer']}\n\n"
+             few_shot_prefix += "Now, using the context provided below, answer the user's question in a similar style:\n"
+             logger.debug("Applied few-shot examples.")
+
+        # 3. Chain-of-Thought Logic (Modify base instruction)
+        if prompt_type == "Chain-of-Thought":
+             cot_prefix = "Let's think step-by-step based *only* on the provided context to answer the question.\n"
+             final_query_instruction = f"Question: {query_placeholder}\nStep-by-step thinking and final Answer:" # Modify final instruction
+             logger.debug("Applied Chain-of-Thought structure.")
+
+        # 4. Default Context Logic (No prefix needed)
+        if prompt_type == "Context-Prompting":
+             logger.debug("Using standard context prompting structure.")
+             pass # No extra prefix needed, base_instruction is sufficient
+
+
+        # --- Assemble the Final Template ---
+        full_template = (
+            persona_prefix +
+            few_shot_prefix + # Examples come first if used
+            cot_prefix +      # CoT instruction modifies the flow
+            base_instruction +
+            final_query_instruction
+        )
+
+        # --- Verification and Fallback ---
+        if "{context_str}" not in full_template or "{query_str}" not in full_template:
+            logger.error("CRITICAL: Constructed prompt template is missing required placeholders ({context_str}, {query_str}). Falling back to basic template.")
+            full_template = f"Context:\n---------------------\n{{context_str}}\n---------------------\nQuery: {{query_str}}\nAnswer:"
+
+        logger.debug(f"Final RAG template generated (start): {full_template[:200]}...")
+        return full_template
+
+    # --- Keep direct prompt generation logic ---
+    def get_direct_prompt(self, query: str, prompt_type: str, persona: Optional[str]) -> str:
+        """
+        Returns a prompt string suitable for a direct LLM call (no context).
+        """
+        logger.debug(f"Generating direct prompt for type: {prompt_type}, persona: {persona}")
+        # Reuse existing methods, ensuring they DON'T add context instructions
+        if prompt_type == "Few-Shot":
+            # Assuming create_few_shot_prompt is suitable for direct query
+            return self.create_few_shot_prompt(query)
+        elif prompt_type == "Chain-of-Thought":
+             # Assuming create_cot_prompt is suitable for direct query
+            return self.create_cot_prompt(query)
+        elif prompt_type == "Persona":
+            # Assuming create_persona_prompt is suitable for direct query
+            return self.create_persona_prompt(query, persona or "financial_advisor")
+        else: # Default direct prompt (Context-Prompting type doesn't make sense here)
+             logger.debug("Using default direct prompt structure.")
+             # Basic instruction for direct query
+             default_persona = self.personas.get('financial_advisor', 'You are a helpful AI assistant.')
+             return f"{default_persona}\n\nAnswer the following query accurately and concisely:\nQuery: {query}\nAnswer:"
+
     def verify_citations(self, response: str, context: List[str]) -> Dict:
         """Verify if the response content is supported by the provided context."""
         citations = {
@@ -157,47 +257,3 @@ class PromptManager:
             pass
             
         return compliance_check
-
-    def get_response(self, query: str, context: Optional[List[str]] = None, prompt_type: str = "context", persona: Optional[str] = None, provider_name: str = "openai") -> str:
-        """Generate a response using the specified prompt engineering technique."""
-        # Create the appropriate prompt based on the prompt type
-        if prompt_type == "few-shot":
-            prompt = self.create_few_shot_prompt(query)
-        elif prompt_type == "context":
-            prompt = self.create_context_prompt(query, context)
-        elif prompt_type == "chain-of-thought":
-            prompt = self.create_cot_prompt(query)
-        elif prompt_type == "persona":
-            if not persona:
-                persona = "financial_advisor"
-            prompt = self.create_persona_prompt(query, persona)
-        else:
-            # Default to context-based prompt
-            prompt = self.create_context_prompt(query, context)
-
-        try:
-            # Get the LLM provider using the same approach as in utils.py
-            from llm_providers import get_llm_provider
-            
-            llm = get_llm_provider(provider_name)
-            if llm is None:
-                raise ValueError(f"Failed to initialize LLM provider: {provider_name}")
-            
-            # Add system prompt for better context
-            system_prompt = (
-                "You are an AI financial advisor. Provide clear, factual financial advice based "
-                "on the given context. Always be transparent about limitations and risks. "
-                "If you're unsure about something, say so explicitly."
-            )
-            
-            # Generate response using the provider
-            response = llm.generate_response(
-                prompt,
-                system_prompt=system_prompt,
-                temperature=0.1  # Using a lower temperature for more focused responses
-            )
-            
-            return response
-            
-        except Exception as e:
-            return f"Error generating response: {str(e)}" 

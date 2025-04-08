@@ -20,7 +20,7 @@ class ConfigLoader:
             
     def get_provider_config(self, provider_name: str) -> Dict[str, Any]:
         """Get configuration for specific LLM provider."""
-        return self.config.get('llm_providers', {}).get(provider_name, {})
+        return self.config.get('ui', {}).get('llm_providers', {})
         
     def get_rag_config(self) -> Dict[str, Any]:
         """Get RAG-specific configuration."""
