@@ -4,8 +4,6 @@ venv
 
 env
 
-storage
-
 __pycache__/
 
 # Python bytecode and cache
