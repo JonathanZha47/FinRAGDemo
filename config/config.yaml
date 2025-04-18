@@ -1,5 +1,3 @@
-
-
 # Query Configurations
 query:
   preprocessing:
@@ -58,3 +56,13 @@ ui:
     openai: ["gpt-3.5-turbo", "gpt-4", "gpt-o3-mini", "gpt-4o"]
     huggingface: ["mistralai/Mixtral-8x7B-Instruct-v0.1"]
     openrouter: ["mistralai/mixtral-8x7b-instruct", "deepseek/deepseek-r1:free"] 
+
+# Evaluation Configurations
+evaluation:
+  # Judge LLM options (can differ from main app LLMs)
+  judge_llm_providers:
+    openai: ["gpt-3.5-turbo", "gpt-4", "gpt-o3-mini", "gpt-4o"]
+    openrouter: ["mistralai/mixtral-8x7b-instruct", "google/gemini-pro"]
+    huggingface: ["google/gemini-pro", "google/gemini-flash", "deepseek/deepseek-chat"]
+  # Add other evaluation-specific configs here if needed 
+  

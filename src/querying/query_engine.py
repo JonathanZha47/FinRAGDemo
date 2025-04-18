@@ -87,7 +87,7 @@ class QueryEngine:
 
     def process_query(self, query: str, index: Optional[BaseIndex], provider_name: str,
                       model_name: str, retriever_type: str, force_rag: bool, prompt_type: str, top_k: int,
-                      persona: Optional[str]) -> Tuple[str, bool, Dict]:
+                      persona: Optional[str]) -> Tuple[str, bool, Dict, str]:
         """Process a user query through the RAG pipeline."""
         analysis_results = {}
         try:
@@ -177,7 +177,8 @@ class QueryEngine:
                              analysis_results['retrieved_nodes_count'] = len(context_nodes)
                         else: analysis_results['llm_context'] = ""; analysis_results['retrieved_nodes_count'] = 0
                         logger.info(f"RAG query successful. Retrieved {analysis_results['retrieved_nodes_count']} nodes.")
-                        return response_text, True, analysis_results
+                        # if use RAG, then return response_text, if_success, analysis_results, response_context
+                        return response_text, True, analysis_results, response_context
                     else:
                          logger.error(f"Failed to create retriever '{retriever_type}'. Fallback Direct.")
                          analysis_results['rag_status'] = f"RAG Attempted ({retriever_type}) - Retriever Failed (Fallback Direct)"
@@ -212,7 +213,8 @@ class QueryEngine:
                          return response_text, False, analysis_results # Return error state
 
                     logger.info("Direct LLM query successful.")
-                    return response_text, True, analysis_results
+                    # if direct query, then we do not have response_context, use empty string instead
+                    return response_text, True, analysis_results, ""
                 except Exception as e:
                     logger.error(f"Error during direct LLM query execution: {e}", exc_info=True)
                     return f"Error processing direct query: {e}", False, analysis_results

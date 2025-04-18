@@ -20,7 +20,6 @@ from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core import Settings
 from llm_providers import get_llm_provider
 from llama_index.core.query_engine import RetrieverQueryEngine
-
 # --- Configure Logging --- 
 # Set root logger level - Note: Streamlit might interfere slightly, 
 # but this sets the baseline for non-Streamlit handlers and our own loggers.
@@ -44,12 +43,6 @@ logger.info("Logging configured. OpenAI and HTTPx loggers set to WARNING level."
 # Load environment variables
 load_dotenv()
 logger.info("Environment variables loaded.")
-
-# Initialize configuration
-config_loader = ConfigLoader()
-# get UI config
-# including temperature, top_k, chunk_size, max_tokens, output_tokens, and llm_providers
-ui_config = config_loader.get_ui_config()
 
 # Load and verify API keys
 openai_key = os.getenv("OPENAI_API_KEY")
@@ -110,7 +103,7 @@ def save_uploaded_file(uploaded_file):
 def sidebar_settings(ui_config: dict):
     """Create sidebar with parameter settings."""
     st.sidebar.title("Settings")
-    
+    st.sidebar.subheader("LLM Settings")
     # LLM Provider Selection
     provider_name = st.sidebar.selectbox(
         "Select LLM Provider",
@@ -125,8 +118,34 @@ def sidebar_settings(ui_config: dict):
         options=available_models,
         index=0
     )
+
+    # Top P Settings(just directly input not from configLoader)
+    top_p = st.sidebar.slider(
+        "Top P",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.3,
+        step=0.01
+    )
+    temperature = st.sidebar.slider(
+        "Temperature",
+        min_value=ui_config['temperature_range'][0],
+        max_value=ui_config['temperature_range'][1],
+        value=0.1,
+        step=ui_config['temperature_range'][2]
+    )
     
-    
+    # Get output token range for selected model
+    output_token_range = ui_config.get('output_tokens_range', {}).get(provider_name, {}).get(model, [1, 2048, 50])
+    # Dynamic max output tokens slider based on model
+    max_output_tokens = st.sidebar.slider(
+        "Max Output Tokens",
+        min_value=output_token_range[0],
+        max_value=output_token_range[1],
+        value=min(1000, output_token_range[1]),  # Default to 1000 or max allowed
+        step=output_token_range[2],
+        help="Maximum number of tokens to generate in the response. Adjusts based on model capabilities."
+    )
     # Prompt Engineering Settings
     st.sidebar.subheader("Prompt Engineering")
     prompt_type = st.sidebar.selectbox(
@@ -152,8 +171,25 @@ def sidebar_settings(ui_config: dict):
     
     # RAG Parameters
     st.sidebar.subheader("RAG Parameters")
+    st.sidebar.caption("Ingestion Settings")
+    chunk_size = st.sidebar.slider(
+        "Chunk Size",
+        min_value=ui_config['chunk_size_range'][0],
+        max_value=ui_config['chunk_size_range'][1],
+        value=1024,
+        step=ui_config['chunk_size_range'][2]
+    )
+
+    chunk_overlap = st.sidebar.slider(
+        "Chunk Overlap",
+        min_value = 25,
+        max_value = 125,
+        value = 50,
+        step = 5
+    )
+    st.sidebar.caption("Retriever Settings")
     top_k = st.sidebar.slider(
-        "Top K Results",
+        "Retrieval Top K",
         min_value=ui_config['top_k_range'][0],
         max_value=ui_config['top_k_range'][1],
         value=3,
@@ -168,40 +204,13 @@ def sidebar_settings(ui_config: dict):
         help="Choose the method for retrieving relevant documents."
     )
     
-    chunk_size = st.sidebar.slider(
-        "Chunk Size",
-        min_value=ui_config['chunk_size_range'][0],
-        max_value=ui_config['chunk_size_range'][1],
-        value=1024,
-        step=ui_config['chunk_size_range'][2]
-    )
-    
-    # LLM Parameters
-    st.sidebar.subheader("LLM Parameters")
-    temperature = st.sidebar.slider(
-        "Temperature",
-        min_value=ui_config['temperature_range'][0],
-        max_value=ui_config['temperature_range'][1],
-        value=0.1,
-        step=ui_config['temperature_range'][2]
-    )
-    
-    # Get output token range for selected model
-    output_token_range = ui_config.get('output_tokens_range', {}).get(provider_name, {}).get(model, [1, 2048, 50])
-    # Dynamic max output tokens slider based on model
-    max_output_tokens = st.sidebar.slider(
-        "Max Output Tokens",
-        min_value=output_token_range[0],
-        max_value=output_token_range[1],
-        value=min(1000, output_token_range[1]),  # Default to 1000 or max allowed
-        step=output_token_range[2],
-        help="Maximum number of tokens to generate in the response. Adjusts based on model capabilities."
-    )
-    
     return {
         "provider_name": provider_name,
         "model": model,
         "prompt_type": prompt_type,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_output_tokens": max_output_tokens,
         "persona": persona,
         "enable_citation_check": enable_citation_check,
         "enable_hallucination_check": enable_hallucination_check,
@@ -209,8 +218,7 @@ def sidebar_settings(ui_config: dict):
         "top_k": top_k,
         "retriever_type": retriever_type,
         "chunk_size": chunk_size,
-        "temperature": temperature,
-        "max_output_tokens": max_output_tokens
+        "chunk_overlap": chunk_overlap
     }
 
 def display_query_analysis(analysis: Dict):
@@ -329,11 +337,15 @@ def main():
     Welcome to the AI Financial Advisor! Ask questions about financial planning, investments, or get general financial advice.
     Optionally, upload documents to get more context-aware responses.
     """)
-    
+    # Initialize configuration
+    config_loader = ConfigLoader()
+    # get UI config
+    # including temperature, top_k, chunk_size, max_tokens, output_tokens, and llm_providers
+    ui_config = config_loader.get_ui_config()
     # Get settings from sidebar
     settings = sidebar_settings(ui_config)
     # get LLM
-    llm = get_llm_provider(settings["provider_name"], settings["model"], settings["temperature"], settings["max_output_tokens"])
+    llm = get_llm_provider(settings["provider_name"], settings["model"], settings["temperature"], settings["top_p"], settings["max_output_tokens"])
 
     # Initialize core components (consider making QueryEngine singleton if needed)
     document_loader = DocumentLoader(config_loader)
@@ -341,13 +353,18 @@ def main():
     query_engine = QueryEngine(llm, config_loader) # Loads index on init now
     prompt_manager = PromptManager(config_loader)
     
+    # use settings dictionary in evaluation page
+    st.session_state.settings = settings
+    st.session_state.llm = llm
+    st.session_state.config_loader = config_loader
+    st.session_state.storage_manager = storage_manager
   
 
     # --- Ingestion Pipeline Setup --- 
     # Define transformations based on settings or config
     # Using OpenAIEmbedding, assuming OPENAI_API_KEY is set
     transformations = [
-        SentenceSplitter(chunk_size=settings['chunk_size'], chunk_overlap=20),
+        SentenceSplitter(chunk_size=settings['chunk_size'], chunk_overlap=settings['chunk_overlap']),
         Settings.embed_model # Use the globally set embedding model
         # Add TitleExtractor back if needed and Settings.llm is configured
         # TitleExtractor(llm=Settings.llm), 
@@ -428,6 +445,9 @@ def main():
     # Query section
     st.subheader("Ask Questions")
     query = st.text_input("Enter your financial question:")
+    # Store the query in the session state
+    st.session_state.query = query
+
     force_rag = st.checkbox("Force RAG Mode", value=False, 
                            help="Force using document retrieval regardless of query analysis")
     
@@ -436,7 +456,7 @@ def main():
 
 
             # Process query - Pass None for index, QE uses its internal one
-            response, success, analysis = query_engine.process_query(
+            response, success, analysis, context = query_engine.process_query(
                 query=query,
                 index=storage_manager.load_index(), 
                 provider_name=settings["provider_name"],
@@ -447,6 +467,9 @@ def main():
                 top_k=settings["top_k"],
                 persona=settings["persona"]
             )
+
+            st.session_state.response = response
+            st.session_state.context = context
             
             results_container = st.container()
             with results_container:

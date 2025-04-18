@@ -209,6 +209,7 @@ def get_llm_provider(provider_name: str, model_name: str) -> Optional[BaseLLMPro
 def get_llm_provider(provider_name: str,
                      model_name: str,
                      temperature: Optional[float] = 0.1, # Optional temperature
+                     top_p: Optional[float] = 0.3, # Optional top_p
                      max_tokens: Optional[int] = 512     # Optional max_tokens
                      ) -> Optional[LLM]:
     """
@@ -218,6 +219,7 @@ def get_llm_provider(provider_name: str,
         provider_name (str): The name of the provider ('openai', 'huggingface', 'openrouter').
         model_name (str): The specific model identifier for the provider.
         temperature (float): The default temperature setting for the LLM.
+        top_p (float): The default top_p setting for the LLM.
         max_tokens (int): The default maximum number of tokens to generate.
 
     Returns:
@@ -237,6 +239,7 @@ def get_llm_provider(provider_name: str,
             llm_instance = OpenAI(
                 model=model_name,
                 temperature=temperature,
+                top_p=top_p,
                 max_tokens=max_tokens # Corresponds to max_tokens in OpenAI API
             )
             # when use it can either llm_instance.stream() or llm_instance.complete()
@@ -260,6 +263,7 @@ def get_llm_provider(provider_name: str,
                 token=api_key_huggingface, # Parameter name is 'token' for HF API Key
                 model_name=model_name,
                 temperature=temperature,
+                top_p=top_p,
                 max_new_tokens=max_tokens # Parameter name is 'max_new_tokens'
                 # Add other params like context_window if needed, e.g., context_window=3900
             )
@@ -275,6 +279,7 @@ def get_llm_provider(provider_name: str,
                 api_key=api_key_openrouter,
                 model=model_name,
                 temperature=temperature,
+                top_p=top_p,
                 max_tokens=max_tokens # Corresponds to max_tokens in OpenRouter API
                 # Add other params like context_window if needed, e.g., context_window=4096
             )

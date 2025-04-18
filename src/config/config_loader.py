@@ -42,6 +42,10 @@ class ConfigLoader:
         """Get UI configuration."""
         return self.config.get('ui', {})
         
+    def get_evaluation_config(self) -> Dict[str, Any]:
+        """Get evaluation-specific configuration."""
+        return self.config.get('evaluation', {})
+        
     def get_model_config(self) -> Dict[str, Any]:
         """Get model configuration including provider and model settings."""
         model_config = self.config.get('model', {})

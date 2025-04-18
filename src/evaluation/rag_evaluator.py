@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Any
 import pandas as pd
 from llama_index.core.evaluation import (
     generate_question_context_pairs,
@@ -7,94 +7,382 @@ from llama_index.core.evaluation import (
     FaithfulnessEvaluator,
     RelevancyEvaluator
 )
-from src.querying.query_engine import QueryEngine
 from src.config.config_loader import ConfigLoader
+from src.evaluation.beir_evaluator import BeirEvaluatorWrapper
 import plotly.graph_objects as go
 import plotly.express as px
 import os
+import logging
+from src.storing.storage_manager import StorageManager
+from src.evaluation.question_generator import QuestionGenerator
+from llama_index.core.llms import LLM
+from llama_index.core.base.response.schema import Response
+import numpy as np
+from src.querying.query_engine import QueryEngine
+from src.retrieval.retrieval import RetrieverFactory
+
+
+logger = logging.getLogger(__name__)
 
 class RAGEvaluator:
-    """Evaluates RAG system performance using LLM-generated QA pairs."""
-    
-    def __init__(self, config_loader: ConfigLoader, query_engine: QueryEngine):
+    """
+    Orchestrates RAG system evaluation using different benchmark types,
+    including retriever and response quality evaluations.
+    Acts as a universal interface.
+    """
+
+    def __init__(self,
+                 config_loader: ConfigLoader,
+                 storage_manager: StorageManager
+                 ):
+        """
+        Initializes the RAG evaluator orchestrator.
+
+        Args:
+            config_loader: Loads project configuration.
+            storage_manager: Manages index storage. Needed for QA generation.
+        """
         self.config_loader = config_loader
-        self.query_engine = query_engine
-        self.faithfulness_evaluator = FaithfulnessEvaluator()
-        self.relevancy_evaluator = RelevancyEvaluator()
-        
+        self.storage_manager = storage_manager
+
+        # Initialize specific evaluators
+        self.beir_evaluator_wrapper = BeirEvaluatorWrapper(config_loader)
+        self.question_generator = QuestionGenerator(storage_manager)
+
         # Define evaluation metrics
-        self.metrics = ["hit_rate", "mrr", "precision", "recall", "ap", "ndcg"]
-        
-    def generate_qa_pairs(self, nodes: List, num_questions_per_chunk: int = 2) -> EmbeddingQAFinetuneDataset:
-        """Generate QA pairs from document nodes using LLM."""
+        self.custom_retriever_metrics = ["hit_rate", "mrr", "precision", "recall", "ap", "ndcg"]
+        self.custom_response_metrics = ["faithfulness", "relevancy"] # Define response metrics
+
+    # --- Methods for Custom QA Pair Evaluation ---
+
+    def generate_qa_pairs(self,
+                           judge_llm: LLM,
+                           num_questions_per_chunk: int = 2
+                           ) -> Optional[EmbeddingQAFinetuneDataset]:
+        """Generate QA pairs from document nodes using the specified judge LLM."""
+        logger.info(f"Delegating QA pair generation to QuestionGenerator...")
+
+        if judge_llm is None:
+            logger.error("Cannot generate QA pairs without a valid judge LLM.")
+            return None
+
         try:
-            # Create evaluation directory if it doesn't exist
-            os.makedirs("data/evaluation", exist_ok=True)
-            
-            # Generate QA pairs
-            qa_dataset = generate_question_context_pairs(
-                nodes=nodes,
+            qa_dataset = self.question_generator.generate(
+                judge_llm=judge_llm,
                 num_questions_per_chunk=num_questions_per_chunk
             )
-            
-            # Save the dataset
-            qa_dataset.save_json("data/evaluation/qa_pairs.json")
-            print(f"Generated {len(qa_dataset.queries)} question-answer pairs")
             return qa_dataset
-            
         except Exception as e:
-            print(f"Error generating QA pairs: {str(e)}")
+            logger.error(f"Error calling QuestionGenerator: {e}", exc_info=True)
             return None
-        
-    def evaluate_retriever(self, retriever, qa_dataset: EmbeddingQAFinetuneDataset = None) -> Tuple[pd.DataFrame, Dict]:
-        """Evaluate retriever performance using generated QA pairs."""
+
+    async def evaluate_retriever_custom_qa(self, retriever, qa_dataset_path: str = "data/evaluation/qa_pairs.json") -> Tuple[pd.DataFrame, Dict]:
+        """Evaluate retriever performance using generated QA pairs (Custom QA Method)."""
+        logger.info(f"Evaluating retriever using custom QA dataset: {qa_dataset_path}")
         try:
-            if qa_dataset is None:
-                # Load existing QA dataset
-                qa_dataset = EmbeddingQAFinetuneDataset.from_json("data/evaluation/qa_pairs.json")
-            
+            # Load existing QA dataset
+            if not os.path.exists(qa_dataset_path):
+                 logger.error(f"QA dataset not found at {qa_dataset_path}")
+                 return pd.DataFrame(), {}
+            qa_dataset = EmbeddingQAFinetuneDataset.from_json(qa_dataset_path)
+            logger.info(f"Loaded {len(qa_dataset.queries)} QA pairs.")
+            # logger.debug(f"QA dataset sample: {list(qa_dataset.queries.items())[:2]}") # Optional: log a sample
+
             # Initialize retriever evaluator
             retriever_evaluator = RetrieverEvaluator.from_metric_names(
-                self.metrics,
+                self.custom_retriever_metrics,
                 retriever=retriever
             )
-            
+
             # Evaluate on entire dataset
-            eval_results = retriever_evaluator.evaluate_dataset(qa_dataset)
-            
+            logger.info("Starting dataset evaluation with RetrieverEvaluator...")
+            retriever_eval_results = await retriever_evaluator.aevaluate_dataset(qa_dataset)
+            logger.info(f"Completed evaluation for {len(retriever_eval_results)} queries.")
+
             # Process results
-            metric_dicts = []
-            for eval_result in eval_results:
-                metric_dicts.append(eval_result.metric_vals_dict)
-            
-            # Create detailed DataFrame
-            results_df = pd.DataFrame(metric_dicts)
-            
-            # Calculate aggregate metrics
-            metrics = {
-                'avg_hit_rate': results_df['hit_rate'].mean(),
-                'avg_mrr': results_df['mrr'].mean(),
-                'avg_precision': results_df['precision'].mean(),
-                'avg_recall': results_df['recall'].mean(),
-                'avg_ap': results_df['ap'].mean(),
-                'avg_ndcg': results_df['ndcg'].mean(),
-                'total_queries': len(results_df)
-            }
-            
-            return results_df, metrics
-            
+            processed_results = [] # Renamed for clarity
+            for eval_result in retriever_eval_results:
+                metric_dict = eval_result.metric_vals_dict.copy() # Get metrics
+
+                # --- Add the query text ---
+                if hasattr(eval_result, 'query') and eval_result.query:
+                    metric_dict['query'] = eval_result.query # Add query to the dict
+                else:
+                    # Fallback if query attribute is missing for some reason
+                    query_id = getattr(eval_result, 'query_id', None) # Try to get ID
+                    metric_dict['query'] = qa_dataset.queries.get(query_id, "Query not found")
+                    if metric_dict['query'] == "Query not found":
+                         logger.warning(f"Query string not found in evaluation result object or QA dataset for query_id: {query_id}")
+                # --- End query addition ---
+
+                processed_results.append(metric_dict) # Append the combined dict
+
+            # Create detailed DataFrame from the processed results
+            retriever_results_df = pd.DataFrame(processed_results)
+
+            if retriever_results_df.empty:
+                 logger.warning("Evaluation resulted in an empty DataFrame.")
+                 return retriever_results_df, {}
+
+            # --- Reorder columns to put 'query' first ---
+            if 'query' in retriever_results_df.columns:
+                 cols = ['query'] + [col for col in retriever_results_df.columns if col != 'query']
+                 retriever_results_df = retriever_results_df[cols]
+            # --- End reordering ---
+
+            # Calculate aggregate metrics (ensure required columns exist)
+            agg_metrics = {}
+            required_cols = ['hit_rate', 'mrr', 'precision', 'recall', 'ap', 'ndcg']
+            for col in required_cols:
+                if col in retriever_results_df.columns:
+                    # Use .astype(float, errors='ignore') or similar if types might be mixed
+                    numeric_col = pd.to_numeric(retriever_results_df[col], errors='coerce')
+                    agg_metrics[f'avg_{col}'] = numeric_col.mean()
+                else:
+                    logger.warning(f"Metric column '{col}' not found in results DataFrame for aggregation.")
+                    agg_metrics[f'avg_{col}'] = None # Or 0 or NaN
+
+            agg_metrics['total_queries'] = len(retriever_results_df)
+            logger.info(f"Aggregate metrics: {agg_metrics}")
+
+            return retriever_results_df, agg_metrics
+
+        except FileNotFoundError:
+             logger.error(f"QA dataset file not found at: {qa_dataset_path}")
+             return pd.DataFrame(), {}
+        except KeyError as ke:
+            logger.error(f"KeyError during evaluation processing, likely missing metric: {ke}", exc_info=True)
+            # Return partial results if possible, or empty
+            return pd.DataFrame(processed_results) if 'processed_results' in locals() else pd.DataFrame(), {}
         except Exception as e:
-            print(f"Error evaluating retriever: {str(e)}")
+            logger.error(f"Error evaluating retriever with custom QA: {e}", exc_info=True)
             return pd.DataFrame(), {}
-    
-    def generate_evaluation_plots(self, results_df: pd.DataFrame) -> Dict:
-        """Generate visualization plots for evaluation results."""
-        plots = {}
-        
+
+    # --- NEW Method for Response Quality Evaluation ---
+    def evaluate_response_quality(self,
+                                 query: str, # path to latest query in data/queries.txt
+                                 retriever: RetrieverFactory,
+                                 response_generator: QueryEngine,
+                                 judge_llm: LLM,
+                                 faithfulness_threshold: float = 0.7,
+                                 relevancy_threshold: float = 0.7
+                                 ) -> Tuple[pd.DataFrame, Dict]:
+        """Evaluates response quality (faithfulness, relevancy) using the provided components."""
+        logger.info("Starting response quality evaluation...")
+
+        if not query:
+            logger.error("No Valid Query Provided")
+            return pd.DataFrame(), {}
+        if not retriever:
+            logger.error("Retriever instance is required.")
+            return pd.DataFrame(), {}
+        if not response_generator:
+            logger.error("Response generator (QueryEngine) instance is required.")
+            return pd.DataFrame(), {}
+        if not judge_llm:
+            logger.error("Judge LLM instance is required for evaluation.")
+            return pd.DataFrame(), {}
+
+        # Initialize evaluators with the judge LLM
         try:
+            faithfulness_evaluator = FaithfulnessEvaluator(llm=judge_llm)
+            relevancy_evaluator = RelevancyEvaluator(llm=judge_llm)
+            logger.info("Faithfulness and Relevancy evaluators initialized.")
+        except Exception as e:
+             logger.error(f"Failed to initialize response quality evaluators: {e}", exc_info=True)
+             return pd.DataFrame(), {}
+
+        response_eval_results = []
+
+        # Get the latest query from data/queries.txt
+        with open("data/queries.txt", "r") as f:
+            query_text = f.readlines()[-1].strip()
+            f.close()
+        logger.info(f"Evaluating response quality for query: {query_text}")
+
+        # Get the retriever type from the query engine
+        retriever_type = self.query_engine.retriever_type
+
+        # Get the latest query from data/queries.txt
+        for i, (query_id, query_text) in enumerate(qa_dataset.queries.items()):
+            logger.debug(f"Evaluating response quality for query {i+1}/{total_queries}: {query_id}")
+            try:
+                # 1. Retrieve context
+                retrieved_nodes = retriever.retrieve(query_text)
+                retrieved_contexts = [node.get_content() for node in retrieved_nodes]
+                if not retrieved_contexts:
+                     logger.warning(f"No context retrieved for query: {query_id}. Skipping response eval.")
+                     # Store result indicating skipped eval
+                     response_eval_results.append({
+                         'query_id': query_id,
+                         'query': query_text,
+                         'response': "N/A (No Context Retrieved)",
+                         'faithfulness': np.nan, # Use NaN for skipped metrics
+                         'relevancy': np.nan,
+                         'is_faithful': None,
+                         'is_relevant': None,
+                         'contexts': [],
+                         'error': "No Context"
+                     })
+                     continue
+
+                # 2. Generate response using the provided generator/query engine
+                # Assuming response_generator.query() returns a Response object or similar
+                # Adapt this call based on your actual response_generator interface
+                response_obj = response_generator.query(query_text)
+                response_str = response_obj.response if hasattr(response_obj, 'response') else str(response_obj) # Get response text
+
+                if not response_str:
+                     logger.warning(f"Empty response generated for query: {query_id}. Skipping response eval.")
+                     response_eval_results.append({
+                         'query_id': query_id,
+                         'query': query_text,
+                         'response': "N/A (Empty Response)",
+                         'faithfulness': np.nan,
+                         'relevancy': np.nan,
+                         'is_faithful': None,
+                         'is_relevant': None,
+                         'contexts': retrieved_contexts,
+                         'error': "Empty Response"
+                     })
+                     continue
+
+
+                # 3. Evaluate Faithfulness
+                try:
+                     faithfulness_result = faithfulness_evaluator.evaluate_response(
+                         response=response_obj, # Pass the Response object if available
+                         query=query_text,      # Pass query text
+                     )
+                     # Note: Check LlamaIndex version; evaluate_response might be the preferred method
+                     # Old way: eval_result = faithfulness_evaluator.evaluate(response=Response(response_str), contexts=retrieved_contexts)
+                     is_faithful = faithfulness_result.passing # Access passing status
+                     faithfulness_score = faithfulness_result.score # Access score
+                except Exception as fe:
+                     logger.error(f"Faithfulness evaluation failed for query {query_id}: {fe}", exc_info=True)
+                     is_faithful = None
+                     faithfulness_score = np.nan
+
+
+                # 4. Evaluate Relevancy
+                try:
+                     relevancy_result = relevancy_evaluator.evaluate_response(
+                         response=response_obj,
+                         query=query_text,
+                     )
+                     # Old way: eval_result = relevancy_evaluator.evaluate(response=Response(response_str), query=query_text)
+                     is_relevant = relevancy_result.passing
+                     relevancy_score = relevancy_result.score
+                except Exception as re:
+                     logger.error(f"Relevancy evaluation failed for query {query_id}: {re}", exc_info=True)
+                     is_relevant = None
+                     relevancy_score = np.nan
+
+
+                # 5. Store results
+                response_eval_results.append({
+                    'query_id': query_id,
+                    'query': query_text,
+                    'response': response_str,
+                    'faithfulness': faithfulness_score,
+                    'relevancy': relevancy_score,
+                    'is_faithful': is_faithful,
+                    'is_relevant': is_relevant,
+                    'contexts': retrieved_contexts, # Store context for inspection
+                    'error': None
+                })
+
+            except Exception as e:
+                logger.error(f"Error processing response evaluation for query {query_id}: {e}", exc_info=True)
+                response_eval_results.append({
+                    'query_id': query_id,
+                    'query': query_text,
+                    'response': "N/A (Error during processing)",
+                    'faithfulness': np.nan,
+                    'relevancy': np.nan,
+                    'is_faithful': None,
+                    'is_relevant': None,
+                    'contexts': [],
+                    'error': str(e)
+                })
+
+        # Create DataFrame
+        results_df = pd.DataFrame(response_eval_results)
+
+        if results_df.empty:
+            logger.warning("Response quality evaluation produced an empty DataFrame.")
+            return results_df, {}
+
+        # Calculate aggregate metrics (handle potential NaNs)
+        aggregate_metrics = {
+            'avg_faithfulness': results_df['faithfulness'].mean(skipna=True),
+            'avg_relevancy': results_df['relevancy'].mean(skipna=True),
+            'faithfulness_pass_rate': (results_df['is_faithful'] == True).mean(skipna=True) if 'is_faithful' in results_df else np.nan,
+            'relevancy_pass_rate': (results_df['is_relevant'] == True).mean(skipna=True) if 'is_relevant' in results_df else np.nan,
+            'num_evaluated': len(results_df),
+            'num_context_errors': (results_df['error'] == "No Context").sum(),
+            'num_response_errors': (results_df['error'] == "Empty Response").sum(),
+            'num_processing_errors': results_df['error'].notna().sum() - (results_df['error'] == "No Context").sum() - (results_df['error'] == "Empty Response").sum()
+        }
+        logger.info(f"Aggregate response quality metrics: {aggregate_metrics}")
+
+        return results_df, aggregate_metrics
+
+    # --- Method for BEIR Evaluation ---
+
+    def evaluate_beir(self,
+                      datasets: List[str],
+                      metrics_k_values: List[int],
+                      embed_model_name: str,
+                      retriever_type: str,
+                      retriever_weights: Optional[Dict[str, float]] = None
+                      ) -> Dict[str, Any]:
+        """
+        Runs the BEIR evaluation using the BeirEvaluatorWrapper with dynamic settings.
+
+        Args:
+            datasets: A list of BEIR dataset names (e.g., ["nfcorpus", "scifact"]).
+            metrics_k_values: A list of k values for ranking metrics (e.g., [3, 10, 30]).
+            embed_model_name: Identifier for the embedding model to use (e.g., "openai", "BAAI/bge-small-en").
+            retriever_type: Type of retriever to use ("vector", "hybrid").
+            retriever_weights: Optional dictionary of weights if retriever_type is "hybrid".
+
+        Returns:
+            A dictionary containing the evaluation results.
+        """
+        logger.info(f"Delegating BEIR evaluation with dynamic settings: embed='{embed_model_name}', retriever='{retriever_type}'")
+        # Pass the new parameters to the wrapper's run_evaluation method
+        return self.beir_evaluator_wrapper.run_evaluation(
+            datasets=datasets,
+            metrics_k_values=metrics_k_values,
+            embed_model_name=embed_model_name,
+            retriever_type=retriever_type,
+            retriever_weights=retriever_weights
+        )
+
+    # --- Common Helper Methods (like plotting) ---
+
+    def generate_evaluation_plots(self, results_df: pd.DataFrame, metrics_list: Optional[List[str]] = None) -> Dict:
+        """Generate visualization plots for evaluation results (primarily for Custom QA)."""
+        # Use default custom QA metrics if none provided
+        metrics_to_plot = metrics_list if metrics_list else self.custom_retriever_metrics
+        plots = {}
+        logger.info("Generating evaluation plots...")
+
+        if results_df.empty:
+             logger.warning("Cannot generate plots from empty DataFrame.")
+             return {}
+
+        try:
+            # Check if provided metrics exist in the DataFrame
+            valid_metrics = [m for m in metrics_to_plot if m in results_df.columns]
+            if not valid_metrics:
+                 logger.warning(f"None of the specified metrics {metrics_to_plot} found in results DataFrame.")
+                 return {}
+
             # Score Distribution Plot
             fig_scores = go.Figure()
-            for metric in self.metrics:
+            for metric in valid_metrics:
                 fig_scores.add_trace(go.Box(y=results_df[metric], name=metric.upper()))
             fig_scores.update_layout(
                 title='Distribution of Retrieval Metrics',
@@ -102,17 +390,18 @@ class RAGEvaluator:
                 showlegend=True
             )
             plots['score_distribution'] = fig_scores
-            
-            # Metric Correlation Plot
-            fig_correlation = px.scatter_matrix(
-                results_df[self.metrics],
-                title='Correlation between Retrieval Metrics'
-            )
-            plots['metric_correlation'] = fig_correlation
-            
+
+            # Metric Correlation Plot (only if more than one metric)
+            if len(valid_metrics) > 1:
+                fig_correlation = px.scatter_matrix(
+                    results_df[valid_metrics],
+                    title='Correlation between Retrieval Metrics'
+                )
+                plots['metric_correlation'] = fig_correlation
+
             # Performance Trend
             fig_performance = go.Figure()
-            for metric in self.metrics:
+            for metric in valid_metrics:
                 fig_performance.add_trace(go.Scatter(
                     y=results_df[metric],
                     name=metric.upper(),
@@ -124,9 +413,10 @@ class RAGEvaluator:
                 yaxis_title='Score'
             )
             plots['performance_trend'] = fig_performance
-            
+
+            logger.info("Successfully generated plots.")
             return plots
-            
+
         except Exception as e:
-            print(f"Error generating evaluation plots: {str(e)}")
+            logger.error(f"Error generating evaluation plots: {e}", exc_info=True)
             return {} 

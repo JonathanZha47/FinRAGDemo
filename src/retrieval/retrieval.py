@@ -95,9 +95,7 @@ class RetrieverFactory:
                 # stemmer = Stemmer.Stemmer("english")
                 return BM25Retriever.from_defaults(
                     nodes=all_nodes,
-                    similarity_top_k=top_k,
-                    stemmer=SnowballStemmer("english"),
-                    language="english"
+                    similarity_top_k=top_k
                     # stemmer=stemmer,
                     # language="english"
                 )
