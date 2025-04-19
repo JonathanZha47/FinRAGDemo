@@ -1,5 +1,5 @@
 huggingface_hub==0.29.3
-llama-index==0.12.28
+llama_index==0.12.28
 nltk==3.9.1
 numpy==1.24.3
 openai==1.71.0
@@ -19,8 +19,3 @@ tabula_py==2.9.3
 tiktoken==0.9.0
 torch==2.1.2
 transformers==4.49.0
-llama-index-retrievers-bm25
-llama-index-llms-huggingface
-llama-index-llms-huggingface-api
-llama-index-llms-openrouter
-llama-index-core

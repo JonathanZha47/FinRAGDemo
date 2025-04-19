@@ -163,11 +163,6 @@ def sidebar_settings(ui_config: dict):
             index=0
         )
     
-    # Verification Settings
-    st.sidebar.subheader("Response Verification")
-    enable_citation_check = st.sidebar.checkbox("Enable Citation Verification", value=True)
-    enable_hallucination_check = st.sidebar.checkbox("Enable Hallucination Detection", value=True)
-    enable_guardrails = st.sidebar.checkbox("Enable SEC Compliance Check", value=True)
     
     # RAG Parameters
     st.sidebar.subheader("RAG Parameters")
@@ -203,6 +198,11 @@ def sidebar_settings(ui_config: dict):
         index=0, # Default to Vector
         help="Choose the method for retrieving relevant documents."
     )
+    # Verification Settings
+    st.sidebar.subheader("Response Verification")
+    enable_citation_check = st.sidebar.checkbox("Enable Citation Verification", value=True, help="Need to be implemented in the future")
+    enable_hallucination_check = st.sidebar.checkbox("Enable Hallucination Detection", value=True, help="Need to be implemented in the future")
+    enable_guardrails = st.sidebar.checkbox("Enable SEC Compliance Check", value=True, help="Need to be implemented in the future")
     
     return {
         "provider_name": provider_name,
@@ -467,7 +467,6 @@ def main():
                 top_k=settings["top_k"],
                 persona=settings["persona"]
             )
-
             st.session_state.response = response
             st.session_state.context = context
             
@@ -484,30 +483,57 @@ def main():
                 rag_status = analysis.get('rag_status', '')
                 was_rag_used = "Used RAG" in rag_status 
                 
-                # Only show verification if RAG was successfully used
-                if was_rag_used and (settings["enable_citation_check"] or settings["enable_hallucination_check"] or settings["enable_guardrails"]):
-                    # We need the actual context used by the LLM for verification.
-                    # This might require modification in PromptManager or QueryEngine 
-                    # to return the context along with the response.
-                    # For now, we'll simulate with an empty context or retrieved nodes if available.
-                    
-                    # Placeholder: Get context if QueryEngine provides it in analysis
-                    llm_context = analysis.get("llm_context", "") 
-                    
-                    citations, hallucination_check, compliance_check = None, None, None
-                    if llm_context: 
-                        if settings["enable_citation_check"]:
-                            citations = prompt_manager.verify_citations(response, llm_context)
-                        if settings["enable_hallucination_check"]:
-                            hallucination_check = prompt_manager.detect_hallucination(response, llm_context, citations)
-                        if settings["enable_guardrails"]:
-                            compliance_check = prompt_manager.apply_guardrails(response, []) # Guardrails might not need context
-                    else:
-                         st.warning("Verification requires context used by LLM, which is not currently passed back. Skipping verification steps.")
+                if was_rag_used and context:
+                    with st.expander("🔍 Retrieved Context Snippets"):
+                        st.caption(f"Top {len(context)} snippets retrieved based on your query and settings:")
+                        for i, node_with_score in enumerate(context):
+                            try:
+                                # Access node and score
+                                node = node_with_score # Assuming context items are NodeWithScore
+                                score = node_with_score.score if hasattr(node_with_score, 'score') else None
+                                text = node.get_content() if hasattr(node, 'get_content') else getattr(node, 'text', 'Error: Cannot get content')
 
-                    # Display verification results if checks were run
-                    if citations or hallucination_check or compliance_check:
-                         display_verification_results(citations or {}, hallucination_check or {}, compliance_check or {})
+                                # Display score if available
+                                score_display = f"(Score: {score:.3f})" if score is not None else "(Score: N/A)"
+                                st.markdown(f"**Snippet {i+1} {score_display}:**")
+
+                                # Display text in a text area
+                                st.text_area(f"Context Snippet {i+1}", value=text, height=100, disabled=True, label_visibility="collapsed")
+                                st.markdown("---") # Separator
+
+                            except Exception as e:
+                                 st.error(f"Error displaying context snippet {i+1}: {e}")
+                                 logger.warning(f"Error processing node {i+1} for display", exc_info=True)
+
+                elif was_rag_used and not context:
+                     with st.expander("🔍 Retrieved Context Snippets"):
+                          st.info("RAG was attempted, but no context snippets were retrieved or returned.")
+
+                # TODO: Implement verification logic
+                # # Only show verification if RAG was successfully used
+                # if was_rag_used and (settings["enable_citation_check"] or settings["enable_hallucination_check"] or settings["enable_guardrails"]):
+                #     # We need the actual context used by the LLM for verification.
+                #     # This might require modification in PromptManager or QueryEngine
+                #     # to return the context along with the response.
+                #     # For now, we'll simulate with an empty context or retrieved nodes if available.
+                #
+                #     # Placeholder: Get context if QueryEngine provides it in analysis
+                #     llm_context = analysis.get("llm_context", "")
+                #
+                #     citations, hallucination_check, compliance_check = None, None, None
+                #     if llm_context:
+                #         if settings["enable_citation_check"]:
+                #             citations = prompt_manager.verify_citations(response, llm_context)
+                #         if settings["enable_hallucination_check"]:
+                #             hallucination_check = prompt_manager.detect_hallucination(response, llm_context, citations)
+                #         if settings["enable_guardrails"]:
+                #             compliance_check = prompt_manager.apply_guardrails(response, []) # Guardrails might not need context
+                #     else:
+                #          st.warning("Verification requires context used by LLM, which is not currently passed back. Skipping verification steps.")
+                #
+                #     # Display verification results if checks were run
+                #     if citations or hallucination_check or compliance_check:
+                #          display_verification_results(citations or {}, hallucination_check or {}, compliance_check or {})
                     
                 # Show processing details
                 with st.expander("Query Processing Details"):

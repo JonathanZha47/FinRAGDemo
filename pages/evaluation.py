@@ -3,7 +3,6 @@ import pandas as pd
 from src.evaluation.rag_evaluator import RAGEvaluator
 from src.config.config_loader import ConfigLoader
 from src.storing.storage_manager import StorageManager
-from src.retrieval.hybrid_retriever import HybridRetriever
 from src.querying.query_engine import QueryEngine
 from src.retrieval.retrieval import RetrieverFactory
 from llama_index.core.evaluation import EmbeddingQAFinetuneDataset
@@ -12,8 +11,11 @@ import os
 import traceback # Import traceback for detailed error printing
 import logging # Import logging
 from src.evaluation.judge_llm_provider import get_judge_llm # Import judge LLM provider
-from typing import Dict, Any # Import Dict and Any for type hinting
+from typing import Dict, Any, List # Import Dict, Any, List for type hinting
 import asyncio
+import numpy as np # Import numpy for NaN checks
+# --- Import the new state manager ---
+import src.evaluation.evaluation_state_manager as eval_state
 
 # Ensure logger is configured (it inherits config from root logger in app.py)
 logger = logging.getLogger(__name__) # Initialize logger for this page
@@ -25,15 +27,30 @@ def display_detailed_results(df):
 # Function to display metrics (ensure it exists or define it)
 def display_metrics(metrics_dict):
     st.write("### Aggregate Metrics")
-    # Format metrics nicely
-    cols = st.columns(len(metrics_dict))
+    if not metrics_dict:
+        st.warning("No metrics data available.")
+        return
+    # Filter out keys that shouldn't be displayed directly as metrics if needed
+    display_keys = [k for k in metrics_dict if k not in ['error']] # Example filter
+
+    cols = st.columns(len(display_keys))
     i = 0
-    for key, value in metrics_dict.items():
-        if isinstance(value, float):
-            cols[i].metric(label=key.replace('_', ' ').title(), value=f"{value:.4f}")
-        else:
-            cols[i].metric(label=key.replace('_', ' ').title(), value=value)
+    for key in display_keys:
+        value = metrics_dict[key]
+        label = key.replace('_', ' ').title()
+        # Handle specific metric display formats
+        if isinstance(value, bool):
+             cols[i].metric(label=label, value="✅ Yes" if value else "❌ No")
+        elif isinstance(value, float):
+             cols[i].metric(label=label, value=f"{value:.4f}" if not pd.isna(value) else "N/A")
+        elif pd.isna(value): # Catch other NaN types
+            cols[i].metric(label=label, value="N/A")
+        else: # Handle integers, strings, etc.
+            cols[i].metric(label=label, value=value)
         i += 1
+    # Optionally display errors separately
+    if 'error' in metrics_dict and metrics_dict['error']:
+         st.error(f"Errors occurred during evaluation: {metrics_dict['error']}")
 
 def display_beir_results(results: dict):
     """Display BEIR evaluation results."""
@@ -204,6 +221,17 @@ def evaluation_sidebar_settings(eval_config: Dict[str, Any]) -> Dict[str, Any]:
         settings_dict["beir_weights"] = weights # Store the calculated weights
         settings_dict["beir_datasets_selected"] = beir_datasets
         settings_dict["beir_k_values_list"] = beir_k_values
+
+    # Add Clear History button conditionally based on selected eval_type
+    eval_type = settings_dict.get("eval_type") # Get the selected type
+    if eval_type == "Current Query Response Quality":
+        st.sidebar.markdown("---")
+        st.sidebar.caption("Clear accumulated response quality results for this session.")
+        if st.sidebar.button("Clear Response Quality History", key="clear_resp_qual_hist"):
+            eval_state.clear_response_quality_history()
+            st.sidebar.success("History Cleared!")
+            # Optional: Rerun immediately if the display needs instant update
+            st.rerun() # Use st.rerun instead of experimental_rerun
 
     logger.debug("Sidebar settings processed.")
     return settings_dict
@@ -416,10 +444,115 @@ def render_evaluation_page():
                          logger.error("Exception during BEIR evaluation.", exc_info=True)
 
             logger.debug("Rendered BEIR UI.")
+            
         elif eval_type == "Current Query Response Quality":
             st.write("You should generate a new query first based on the documents uploaded in the main page, and then evaluate the response quality of the RAG system using the generated query.")
             st.write("This will use the same settings as the main page.")
+            # Retrieve necessary data from session state
+            last_query = st.session_state.get("query")
+            last_response = st.session_state.get("response")
+            last_context_nodes = st.session_state.get("context") # This should be List[NodeWithScore] or similar
 
+            # Get Judge LLM settings from sidebar
+            judge_provider_ss = settings.get('judge_provider')
+            judge_model_ss = settings.get('judge_model')
+
+            can_evaluate = True
+            if not last_query:
+                st.warning("⚠️ No query found in session state. Please run a query on the main page first.")
+                can_evaluate = False
+            if not last_response:
+                st.warning("⚠️ No response found in session state. Please run a query on the main page first.")
+                can_evaluate = False
+            # Context is optional for relevancy, but required for faithfulness
+            if not last_context_nodes:
+                st.info("ℹ️ No retrieved context found in session state (RAG might not have been used). Faithfulness check cannot be performed accurately.")
+                # Allow evaluation, but expect faithfulness to fail/be NaN
+                last_context_nodes = [] # Ensure it's an empty list
+
+            if not judge_provider_ss or not judge_model_ss:
+                 st.warning("⚠️ Judge LLM provider or model not selected in the sidebar.")
+                 can_evaluate = False
+
+            # Display the last interaction details
+            st.markdown("---")
+            st.write("**Last Interaction Details:**")
+            st.text_input("Query:", value=last_query or "N/A", disabled=True)
+            st.text_area("Response:", value=last_response or "N/A", height=150, disabled=True)
+
+            # Prepare context strings needed for evaluation
+            context_texts_for_eval: List[str] = []
+            with st.expander("Retrieved Context Snippets Used"):
+                if last_context_nodes:
+                    for i, node in enumerate(last_context_nodes):
+                        try:
+                            # Extract text content using get_content()
+                            text = node.get_content() if hasattr(node, 'get_content') else getattr(node, 'text', 'Error: Cannot get content')
+                            context_texts_for_eval.append(text)
+                            st.markdown(f"**Snippet {i+1} (Score: {node.score:.3f}):**" if hasattr(node, 'score') else f"**Snippet {i+1}:**")
+                            st.text_area(f"snippet_{i}", value=text, height=100, disabled=True, label_visibility="collapsed")
+                        except Exception as e:
+                             st.error(f"Could not display/process context snippet {i+1}: {e}")
+                             logger.warning(f"Error processing node {i+1} for display/eval", exc_info=True)
+                else:
+                    st.write("No context snippets available.")
+            st.markdown("---")
+
+            # --- Evaluation Button and Logic ---
+            if st.button("Evaluate and Accumulate Response Quality", key="eval_accumulate_response", disabled=not can_evaluate):
+                 logger.debug("Evaluate and Accumulate Response Quality button clicked.")
+                 with st.spinner(f"Evaluating response quality using Judge LLM: {judge_provider_ss}/{judge_model_ss}..."):
+                     try:
+                        # 1. Initialize Judge LLM
+                        logger.info(f"Initializing Judge LLM: {judge_provider_ss}/{judge_model_ss}")
+                        judge_llm = get_judge_llm(judge_provider_ss, judge_model_ss)
+                        if judge_llm is None:
+                            st.error(f"Failed to initialize Judge LLM: {judge_provider_ss}/{judge_model_ss}. Check API keys and configuration.")
+                            return # Stop execution here
+
+                        # 2. Call the evaluation function (already have context strings)
+                        logger.info(f"Calling evaluate_response_quality with query, response, {len(context_texts_for_eval)} context strings.")
+                        new_results_df, metrics = evaluator.evaluate_response_quality(
+                            query=last_query,
+                            response_str=last_response,
+                            retrieved_contexts=context_texts_for_eval, # Pass list of strings
+                            judge_llm=judge_llm
+                        )
+
+                        # 3. Accumulate results
+                        if new_results_df is not None:
+                            # Append the new DataFrame to the one in session state
+                            eval_state.append_response_quality_result(new_results_df)
+                            st.success("✅ Response Quality Evaluated and Added to History!")
+                            logger.info("Response quality evaluation successful and appended.")
+                            # Rerun to update the display immediately after appending
+                            st.rerun()
+                        else:
+                             # Display error from metrics dict if available
+                             error_msg = metrics.get("error", "Evaluation function returned None.") if metrics else "Evaluation function returned None."
+                             st.error(f"❌ Evaluation failed: {error_msg}")
+                             logger.error(f"Response quality evaluation failed. Error: {error_msg}")
+
+                     except Exception as e:
+                         st.error(f"❌ Evaluation failed with unexpected error: {str(e)}")
+                         logger.error("Exception during Current Response Quality evaluation.", exc_info=True)
+                         st.exception(e) # Show detailed traceback in Streamlit UI
+
+            # --- Display Accumulated Results ---
+            st.markdown("---")
+            st.subheader("Cumulative Response Quality Results")
+            cumulative_df = eval_state.get_response_quality_df()
+
+            if not cumulative_df.empty:
+                 # Calculate aggregate metrics from the cumulative DataFrame
+                 cumulative_metrics = eval_state.calculate_cumulative_response_metrics(cumulative_df)
+                 display_metrics(cumulative_metrics) # Display aggregated metrics
+                 st.write("### Detailed History")
+                 display_detailed_results(cumulative_df) # Display the full accumulated DataFrame
+            else:
+                 st.info("No response quality evaluations run in this session yet, or history has been cleared.")
+
+            logger.debug("Rendered Current Query Response Quality UI.")
         # Display cached results if available
         if eval_type == "Custom QA Pairs" and 'eval_results' in st.session_state:
             logger.debug("Displaying cached Custom QA results.")

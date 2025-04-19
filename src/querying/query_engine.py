@@ -19,6 +19,7 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.data_structs import Node
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.response_synthesizers import get_response_synthesizer
+from llama_index.core.schema import NodeWithScore
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +87,8 @@ class QueryEngine:
             return False
 
     def process_query(self, query: str, index: Optional[BaseIndex], provider_name: str,
-                      model_name: str, retriever_type: str, force_rag: bool, prompt_type: str, top_k: int,
-                      persona: Optional[str]) -> Tuple[str, bool, Dict, str]:
+                      model_name: str, retriever_type: str, force_rag: bool, prompt_type: Optional[str], top_k: int,
+                      persona: Optional[str]) -> Tuple[str, bool, Dict, Optional[List[NodeWithScore]]]:
         """Process a user query through the RAG pipeline."""
         analysis_results = {}
         try:
@@ -167,7 +168,7 @@ class QueryEngine:
                         response_obj = engine.query(processed_query)
                         response_text = response_obj.response
 
-                        response_context = "\n".join([node.get_content() for node in response_obj.source_nodes])
+                        response_context = response_obj.source_nodes
 
                         # --- Update Analysis ---
                         analysis_results['rag_status'] = f"Used RAG ({retriever_type})"
@@ -210,19 +211,19 @@ class QueryEngine:
                     # Basic check if the response indicates an error returned by the provider
                     if "Error:" in response_text:
                          logger.error(f"Direct LLM query failed with provider error: {response_text}")
-                         return response_text, False, analysis_results # Return error state
+                         return response_text, False, analysis_results, None # Return error state
 
                     logger.info("Direct LLM query successful.")
                     # if direct query, then we do not have response_context, use empty string instead
-                    return response_text, True, analysis_results, ""
+                    return response_text, True, analysis_results, None
                 except Exception as e:
                     logger.error(f"Error during direct LLM query execution: {e}", exc_info=True)
-                    return f"Error processing direct query: {e}", False, analysis_results
+                    return f"Error processing direct query: {e}", False, analysis_results, None
 
         except Exception as e:
              logger.error(f"Unhandled error in process_query: {e}", exc_info=True)
              analysis_results['error'] = f"Unhandled error: {str(e)}"
-             return f"An unexpected error occurred: {str(e)}", False, analysis_results
+             return f"An unexpected error occurred: {str(e)}", False, analysis_results, None
     
     
     def _check_if_needs_retrieval(self, query: str, analysis: Dict) -> bool:

@@ -161,170 +161,130 @@ class RAGEvaluator:
     # --- NEW Method for Response Quality Evaluation ---
     def evaluate_response_quality(self,
                                  query: str, # path to latest query in data/queries.txt
-                                 retriever: RetrieverFactory,
-                                 response_generator: QueryEngine,
+                                 retrieved_contexts: str,
+                                 response_str: str,
                                  judge_llm: LLM,
                                  faithfulness_threshold: float = 0.7,
                                  relevancy_threshold: float = 0.7
                                  ) -> Tuple[pd.DataFrame, Dict]:
-        """Evaluates response quality (faithfulness, relevancy) using the provided components."""
-        logger.info("Starting response quality evaluation...")
+        """
+        Evaluates faithfulness and relevancy for a *single given query, response, and context*.
 
+        Args:
+            query: The user query string.
+            response_str: The generated response string.
+            retrieved_contexts: A list of context strings used for the response.
+            judge_llm: The LLM instance to use for judging.
+
+        Returns:
+            A tuple containing:
+            - A pandas DataFrame with the evaluation results for the single query (or None on error).
+            - A dictionary with metrics for the single result (or None on error).
+        """
+        logger.info(f"Starting response quality evaluation for query: '{query[:50]}...'")
+
+        # --- Input Validation ---
         if not query:
-            logger.error("No Valid Query Provided")
-            return pd.DataFrame(), {}
-        if not retriever:
-            logger.error("Retriever instance is required.")
-            return pd.DataFrame(), {}
-        if not response_generator:
-            logger.error("Response generator (QueryEngine) instance is required.")
-            return pd.DataFrame(), {}
+            logger.error("evaluate_response_quality requires a query string.")
+            return None, {"error": "Query string is required"}
+        if not response_str:
+            logger.warning("evaluate_response_quality called with an empty response string.")
+            # Decide how to handle: error or evaluate with empty response? Let's error for now.
+            return None, {"error": "Empty response string provided"}
         if not judge_llm:
-            logger.error("Judge LLM instance is required for evaluation.")
-            return pd.DataFrame(), {}
+            logger.error("evaluate_response_quality requires a Judge LLM instance.")
+            return None, {"error": "Judge LLM not provided"}
+        # Allow empty context, but log it
+        if not retrieved_contexts:
+             logger.warning("evaluate_response_quality called with empty retrieved_contexts list. Faithfulness might be affected.")
+             retrieved_contexts = [] # Ensure it's an empty list
 
-        # Initialize evaluators with the judge LLM
+        # --- Initialize Evaluators ---
         try:
             faithfulness_evaluator = FaithfulnessEvaluator(llm=judge_llm)
             relevancy_evaluator = RelevancyEvaluator(llm=judge_llm)
             logger.info("Faithfulness and Relevancy evaluators initialized.")
         except Exception as e:
              logger.error(f"Failed to initialize response quality evaluators: {e}", exc_info=True)
-             return pd.DataFrame(), {}
+             return None, {"error": f"Evaluator initialization failed: {e}"}
 
-        response_eval_results = []
-
-        # Get the latest query from data/queries.txt
-        with open("data/queries.txt", "r") as f:
-            query_text = f.readlines()[-1].strip()
-            f.close()
-        logger.info(f"Evaluating response quality for query: {query_text}")
-
-        # Get the retriever type from the query engine
-        retriever_type = self.query_engine.retriever_type
-
-        # Get the latest query from data/queries.txt
-        for i, (query_id, query_text) in enumerate(qa_dataset.queries.items()):
-            logger.debug(f"Evaluating response quality for query {i+1}/{total_queries}: {query_id}")
-            try:
-                # 1. Retrieve context
-                retrieved_nodes = retriever.retrieve(query_text)
-                retrieved_contexts = [node.get_content() for node in retrieved_nodes]
-                if not retrieved_contexts:
-                     logger.warning(f"No context retrieved for query: {query_id}. Skipping response eval.")
-                     # Store result indicating skipped eval
-                     response_eval_results.append({
-                         'query_id': query_id,
-                         'query': query_text,
-                         'response': "N/A (No Context Retrieved)",
-                         'faithfulness': np.nan, # Use NaN for skipped metrics
-                         'relevancy': np.nan,
-                         'is_faithful': None,
-                         'is_relevant': None,
-                         'contexts': [],
-                         'error': "No Context"
-                     })
-                     continue
-
-                # 2. Generate response using the provided generator/query engine
-                # Assuming response_generator.query() returns a Response object or similar
-                # Adapt this call based on your actual response_generator interface
-                response_obj = response_generator.query(query_text)
-                response_str = response_obj.response if hasattr(response_obj, 'response') else str(response_obj) # Get response text
-
-                if not response_str:
-                     logger.warning(f"Empty response generated for query: {query_id}. Skipping response eval.")
-                     response_eval_results.append({
-                         'query_id': query_id,
-                         'query': query_text,
-                         'response': "N/A (Empty Response)",
-                         'faithfulness': np.nan,
-                         'relevancy': np.nan,
-                         'is_faithful': None,
-                         'is_relevant': None,
-                         'contexts': retrieved_contexts,
-                         'error': "Empty Response"
-                     })
-                     continue
-
-
-                # 3. Evaluate Faithfulness
-                try:
-                     faithfulness_result = faithfulness_evaluator.evaluate_response(
-                         response=response_obj, # Pass the Response object if available
-                         query=query_text,      # Pass query text
-                     )
-                     # Note: Check LlamaIndex version; evaluate_response might be the preferred method
-                     # Old way: eval_result = faithfulness_evaluator.evaluate(response=Response(response_str), contexts=retrieved_contexts)
-                     is_faithful = faithfulness_result.passing # Access passing status
-                     faithfulness_score = faithfulness_result.score # Access score
-                except Exception as fe:
-                     logger.error(f"Faithfulness evaluation failed for query {query_id}: {fe}", exc_info=True)
-                     is_faithful = None
-                     faithfulness_score = np.nan
-
-
-                # 4. Evaluate Relevancy
-                try:
-                     relevancy_result = relevancy_evaluator.evaluate_response(
-                         response=response_obj,
-                         query=query_text,
-                     )
-                     # Old way: eval_result = relevancy_evaluator.evaluate(response=Response(response_str), query=query_text)
-                     is_relevant = relevancy_result.passing
-                     relevancy_score = relevancy_result.score
-                except Exception as re:
-                     logger.error(f"Relevancy evaluation failed for query {query_id}: {re}", exc_info=True)
-                     is_relevant = None
-                     relevancy_score = np.nan
-
-
-                # 5. Store results
-                response_eval_results.append({
-                    'query_id': query_id,
-                    'query': query_text,
-                    'response': response_str,
-                    'faithfulness': faithfulness_score,
-                    'relevancy': relevancy_score,
-                    'is_faithful': is_faithful,
-                    'is_relevant': is_relevant,
-                    'contexts': retrieved_contexts, # Store context for inspection
-                    'error': None
-                })
-
-            except Exception as e:
-                logger.error(f"Error processing response evaluation for query {query_id}: {e}", exc_info=True)
-                response_eval_results.append({
-                    'query_id': query_id,
-                    'query': query_text,
-                    'response': "N/A (Error during processing)",
-                    'faithfulness': np.nan,
-                    'relevancy': np.nan,
-                    'is_faithful': None,
-                    'is_relevant': None,
-                    'contexts': [],
-                    'error': str(e)
-                })
-
-        # Create DataFrame
-        results_df = pd.DataFrame(response_eval_results)
-
-        if results_df.empty:
-            logger.warning("Response quality evaluation produced an empty DataFrame.")
-            return results_df, {}
-
-        # Calculate aggregate metrics (handle potential NaNs)
-        aggregate_metrics = {
-            'avg_faithfulness': results_df['faithfulness'].mean(skipna=True),
-            'avg_relevancy': results_df['relevancy'].mean(skipna=True),
-            'faithfulness_pass_rate': (results_df['is_faithful'] == True).mean(skipna=True) if 'is_faithful' in results_df else np.nan,
-            'relevancy_pass_rate': (results_df['is_relevant'] == True).mean(skipna=True) if 'is_relevant' in results_df else np.nan,
-            'num_evaluated': len(results_df),
-            'num_context_errors': (results_df['error'] == "No Context").sum(),
-            'num_response_errors': (results_df['error'] == "Empty Response").sum(),
-            'num_processing_errors': results_df['error'].notna().sum() - (results_df['error'] == "No Context").sum() - (results_df['error'] == "Empty Response").sum()
+        # --- Prepare Data Structure ---
+        eval_data = {
+            'query': query,
+            'response': response_str,
+            'faithfulness': np.nan,
+            'relevancy': np.nan,
+            'is_faithful': None,
+            'is_relevant': None,
+            'contexts': retrieved_contexts, # Store context for inspection
+            'error': None
         }
-        logger.info(f"Aggregate response quality metrics: {aggregate_metrics}")
+
+        # --- Perform Evaluations ---
+        try:
+            # 1. Evaluate Faithfulness
+            faith_error = None
+            try:
+                 logger.debug("Evaluating Faithfulness...")
+                 # Pass contexts directly to the evaluate method
+                 faithfulness_result = faithfulness_evaluator.evaluate(
+                     query=query,
+                     response=response_str,
+                     contexts=retrieved_contexts # Pass context strings directly
+                 )
+                 eval_data['is_faithful'] = faithfulness_result.passing
+                 eval_data['faithfulness'] = faithfulness_result.score
+                 logger.info(f"Faithfulness evaluation complete. Score: {eval_data['faithfulness']}, Passing: {eval_data['is_faithful']}")
+            except Exception as fe:
+                 logger.error(f"Faithfulness evaluation failed: {fe}", exc_info=True)
+                 faith_error = f"Faithfulness Error: {fe}"
+
+
+            # 2. Evaluate Relevancy
+            relevancy_error = None
+            try:
+                 logger.debug("Evaluating Relevancy...")
+                 relevancy_result = relevancy_evaluator.evaluate(
+                     query=query,
+                     response=response_str,
+                     contexts=retrieved_contexts # Context might be less critical here but pass anyway
+                 )
+                 eval_data['is_relevant'] = relevancy_result.passing
+                 eval_data['relevancy'] = relevancy_result.score
+                 logger.info(f"Relevancy evaluation complete. Score: {eval_data['relevancy']}, Passing: {eval_data['is_relevant']}")
+            except Exception as re:
+                 logger.error(f"Relevancy evaluation failed: {re}", exc_info=True)
+                 relevancy_error = f"Relevancy Error: {re}"
+
+            # Combine errors if they occurred
+            errors = [e for e in [faith_error, relevancy_error] if e is not None]
+            if errors:
+                 eval_data['error'] = "; ".join(errors)
+
+
+        except Exception as e:
+            # Catch broader errors during the process
+            logger.error(f"Unexpected error during response evaluation processing: {e}", exc_info=True)
+            eval_data['error'] = f"Processing Error: {e}"
+
+        # --- Format Results ---
+        # Create DataFrame for the single result
+        try:
+            results_df = pd.DataFrame([eval_data]) # List containing the single dict
+        except Exception as df_e:
+             logger.error(f"Failed to create DataFrame from evaluation data: {df_e}", exc_info=True)
+             return None, {"error": f"DataFrame creation failed: {df_e}"}
+
+
+        # Calculate "aggregate" metrics (just the values from the single run)
+        aggregate_metrics = {
+            'faithfulness_score': eval_data['faithfulness'],
+            'relevancy_score': eval_data['relevancy'],
+            'is_faithful': eval_data['is_faithful'],
+            'is_relevant': eval_data['is_relevant'],
+            'error': eval_data['error']
+        }
+        logger.info(f"Single response quality metrics: {aggregate_metrics}")
 
         return results_df, aggregate_metrics
 
