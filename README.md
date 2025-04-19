@@ -40,7 +40,10 @@ pip install -r requirements.txt
 3. Create a `.env` file in the root directory and add your API keys:
 ```
 OPENAI_API_KEY=your_openai_api_key_here
-# Add other API keys as needed (HuggingFace, OpenRouter, etc.)
+
+HUGGINGFACE_API_KEY=your_hf_api_key_here
+
+OPENROUTER_API_KEY=your_openrouter_api_key_here
 ```
 
 ### Usage
